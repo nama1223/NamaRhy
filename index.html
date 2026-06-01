@@ -31,6 +31,11 @@ header{display:flex;align-items:center;gap:10px;padding:13px 15px;border-bottom:
 header h1{font-size:18px;margin:0;font-weight:800;letter-spacing:.01em;flex:1;background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
 header .bk{display:none;border:1px solid var(--line);background:#fff;color:var(--txt);width:34px;height:34px;border-radius:10px;font-size:18px;box-shadow:var(--sh)}
 header.sub .bk{display:block}
+.lvnav{display:none;align-items:center;gap:5px}
+header.train .lvnav{display:flex}
+.lvnav button{border:1px solid var(--line);background:#fff;color:var(--txt);width:30px;height:30px;border-radius:9px;font-size:15px;box-shadow:var(--sh);display:flex;align-items:center;justify-content:center;padding:0}
+.lvnav button:disabled{opacity:.35}
+.lvnav .lvbadge{font-size:13px;font-weight:800;color:var(--acc);min-width:36px;text-align:center}
 main{flex:1;padding:15px;max-width:600px;width:100%;margin:0 auto}
 .screen{display:none;animation:fade .2s ease}
 .screen.on{display:block}
@@ -94,12 +99,20 @@ input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;bac
 .switch input:checked+span:before{transform:translateX(21px)}
 small.note{display:block;color:var(--sub);font-size:11.5px;margin-top:8px;line-height:1.6}
 .hero{font-size:12.5px;color:var(--sub);margin:-2px 2px 12px;line-height:1.5}
+.seg.sm button{padding:7px 10px;font-size:12px}
+.rec-playback{display:none;margin-top:10px}
+.rec-playback.on{display:block;animation:fade .2s}
 </style>
 </head>
 <body>
 <header id="hdr">
   <button class="bk" id="back">‹</button>
   <h1 id="title">NamaRhy</h1>
+  <div class="lvnav" id="lvnav">
+    <button id="lvPrev" title="前のレベル">‹</button>
+    <span class="lvbadge" id="lvNavBadge">Lv5</span>
+    <button id="lvNext" title="次のレベル">›</button>
+  </div>
 </header>
 <main>
 
@@ -147,6 +160,13 @@ small.note{display:block;color:var(--sub);font-size:11.5px;margin-top:8px;line-h
         <span class="hint">リズムのガイド音を鳴らす</span>
         <label class="switch"><input type="checkbox" id="guideTog"><span></span></label>
       </div>
+      <div style="margin-top:10px">
+        <div class="hint" style="margin-bottom:5px">カウントイン</div>
+        <div class="seg sm" id="countInSeg">
+          <button data-ci="1" class="on">1小節</button>
+          <button data-ci="2">2小節</button>
+        </div>
+      </div>
     </div>
 
     <div class="row" style="margin-bottom:9px">
@@ -175,6 +195,10 @@ small.note{display:block;color:var(--sub);font-size:11.5px;margin-top:8px;line-h
           <span><i style="background:#9aa0b8"></i>Miss</span>
         </div>
         <small class="note">判定基準を切り替えると、同じ演奏のまま再採点します。</small>
+      </div>
+      <div class="rec-playback" id="recPlayback">
+        <button class="btn sec sm" id="recPlayBtn">▶ 録音を聴き返す（クリック付き）</button>
+        <button class="btn sec sm" id="recStopBtn" style="display:none">■ 停止</button>
       </div>
       <div class="row">
         <button class="btn sec sm" id="againBtn">↻ もう一度</button>
@@ -248,7 +272,7 @@ const $=id=>document.getElementById(id);
 
 /* ---------- 保存データ ---------- */
 const SKEY='namaRhy.v1';
-const DEF={ calib:0, sens:5, guide:false, mode:'onset', level:5, micId:'', logs:[] };
+const DEF={ calib:0, sens:5, guide:false, mode:'onset', level:5, micId:'', countIn:1, logs:[] };
 let DB=load();
 function load(){
   let d; try{ d=Object.assign({},DEF,JSON.parse(localStorage.getItem(SKEY))||{}); }catch(e){ d=Object.assign({},DEF); }
@@ -580,7 +604,9 @@ function click(time,kind){
 /* =========================================================================
    シーケンサ／再生ヘッド／採点
    ========================================================================= */
-const SEQ={running:false,record:false,schedule:[],si:0,startT:0,rhythmStart:0,spb:0,endT:0,raf:0,timer:0,events:[],rhythm:null,onFinish:null,wake:null};
+const SEQ={running:false,record:false,schedule:[],si:0,startT:0,rhythmStart:0,spb:0,endT:0,raf:0,timer:0,events:[],rhythm:null,onFinish:null,wake:null,
+  // 録音再生用
+  mr:null,mrChunks:[],recBlob:null,recUrl:null,recStart:0,recRhythmOffset:0};
 function buildSchedule(rhythm,{guide,countInM=1}){
   const spb=60/rhythm.bpm, groups=rhythm.groups, totalQ=rhythm.totalQ, measuresAll=countInM+rhythm.measures;
   const start=AU.ctx.currentTime+0.35, rhythmStart=start+countInM*totalQ*spb, sch=[];
@@ -593,10 +619,26 @@ async function startSeq(rhythm,{record,guide},onFinish){
   if(SEQ.running) return;
   const ok = record? await ensureMic() : (await ensureCtx(),true);
   if(record && !ok) return;
-  const ci=rhythm.groups.length>=3?1:2;
+  const ci = DB.countIn || 1;
   const b=buildSchedule(rhythm,{guide,countInM:ci});
-  Object.assign(SEQ,{running:true,record,schedule:b.sch,si:0,startT:b.start,rhythmStart:b.rhythmStart,spb:b.spb,endT:b.endT,events:[],rhythm,onFinish});
-  if(record){ detector.reset(); detector.onOnset=t=>SEQ.events.push({onset:t,peak:null}); detector.onPeak=t=>{ for(let i=SEQ.events.length-1;i>=0;i--){ if(SEQ.events[i].peak===null){SEQ.events[i].peak=t;break;} } }; }
+  Object.assign(SEQ,{running:true,record,schedule:b.sch,si:0,startT:b.start,rhythmStart:b.rhythmStart,spb:b.spb,endT:b.endT,events:[],rhythm,onFinish,
+    mr:null,mrChunks:[],recBlob:null,recUrl:null,recStart:b.start,recRhythmOffset:b.rhythmStart-b.start});
+  if(record){ detector.reset(); detector.onOnset=t=>SEQ.events.push({onset:t,peak:null}); detector.onPeak=t=>{ for(let i=SEQ.events.length-1;i>=0;i--){ if(SEQ.events[i].peak===null){SEQ.events[i].peak=t;break;} } };
+    // MediaRecorder で演奏録音
+    if(AU.stream && window.MediaRecorder){
+      try{
+        SEQ.mrChunks=[];
+        SEQ.mr=new MediaRecorder(AU.stream);
+        SEQ.mr.ondataavailable=e=>{ if(e.data.size>0) SEQ.mrChunks.push(e.data); };
+        SEQ.mr.onstop=()=>{
+          if(SEQ.recUrl){ URL.revokeObjectURL(SEQ.recUrl); SEQ.recUrl=null; }
+          SEQ.recBlob=new Blob(SEQ.mrChunks,{type:SEQ.mrChunks[0]?.type||'audio/webm'});
+          SEQ.recUrl=URL.createObjectURL(SEQ.recBlob);
+        };
+        SEQ.mr.start();
+      }catch(e){ SEQ.mr=null; }
+    }
+  }
   else { detector.onOnset=null; detector.onPeak=null; }
   try{ if(navigator.wakeLock) SEQ.wake=await navigator.wakeLock.request('screen'); }catch(e){}
   RES=null; renderScore(rhythm); $('result').classList.remove('on'); $('playhead').style.display='none';
@@ -636,6 +678,8 @@ function finishSeq(){
   SEQ.running=false; clearInterval(SEQ.timer); cancelAnimationFrame(SEQ.raf);
   $('countin').style.display='none'; $('playhead').style.display='none';
   if(SEQ.wake){try{SEQ.wake.release();}catch(e){} SEQ.wake=null;}
+  // MediaRecorder停止
+  if(SEQ.mr && SEQ.mr.state!=='inactive'){ try{ SEQ.mr.stop(); }catch(e){} }
   setBusy(false);
   const cb=SEQ.onFinish; SEQ.onFinish=null; if(cb) cb();
 }
@@ -667,6 +711,7 @@ let CUR=null, LAST=null, RES=null;
 function show(id){
   document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id===id));
   const sub=id!=='s-home'; $('hdr').classList.toggle('sub',sub);
+  $('hdr').classList.toggle('train', id==='s-train');
   const titles={'s-train':'練習','s-set':'設定','s-hist':'記録'};
   $('title').textContent = sub? titles[id] : 'NamaRhy';
   if(id==='s-hist') renderHist();
@@ -678,7 +723,10 @@ function reRender(){ if(CUR && $('s-train').classList.contains('on')) renderScor
 
 /* ホーム */
 $('lvRange').addEventListener('input',e=>{ const l=+e.target.value; $('lvNum').textContent=l; $('lvDesc').textContent=lvDesc(l); DB.level=l; save(); });
-function initHome(){ $('lvRange').value=DB.level; $('lvNum').textContent=DB.level; $('lvDesc').textContent=lvDesc(DB.level); }
+function initHome(){
+  $('lvRange').value=DB.level; $('lvNum').textContent=DB.level; $('lvDesc').textContent=lvDesc(DB.level);
+  if(!DB.countIn) DB.countIn=1;
+}
 
 /* トレーニング */
 function openTrain(rhythm){
@@ -686,6 +734,13 @@ function openTrain(rhythm){
   $('tLv').textContent=rhythm.level; $('tBpm').textContent=rhythm.bpm; $('tSig').textContent=rhythm.sig;
   $('tTag').textContent = rhythm.fromHist? '再挑戦' : '';
   $('result').classList.remove('on');
+  $('recPlayback').classList.remove('on');
+  // レベルナビ更新
+  $('lvNavBadge').textContent='Lv '+rhythm.level;
+  $('lvPrev').disabled=rhythm.level<=1;
+  $('lvNext').disabled=rhythm.level>=30;
+  // カウントイン選択UI同期
+  document.querySelectorAll('#countInSeg button').forEach(b=>b.classList.toggle('on',+b.dataset.ci===DB.countIn));
   show('s-train');
   document.querySelectorAll('#modeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.m===DB.mode));
   $('guideTog').checked=DB.guide;
@@ -694,10 +749,64 @@ function openTrain(rhythm){
 $('goTrain').onclick=()=>openTrain(genRhythm(DB.level));
 const newRhythm=()=>openTrain(genRhythm(DB.level));
 $('newBtn').onclick=newRhythm; $('newBtn2').onclick=newRhythm;
-$('againBtn').onclick=()=>{ if(CUR){ LAST=null; RES=null; $('result').classList.remove('on'); renderScore(CUR); } };
+$('againBtn').onclick=()=>{ if(CUR){ LAST=null; RES=null; $('result').classList.remove('on'); $('recPlayback').classList.remove('on'); renderScore(CUR); } };
 $('listenBtn').onclick=()=> startSeq(CUR,{record:false,guide:true},()=>{});
 $('stopBtn').onclick=stopSeq;
 $('nextBtn').onclick=()=>{ const nl=Math.min(30,(CUR?CUR.level:DB.level)+1); DB.level=nl; save(); $('lvRange').value=nl; $('lvNum').textContent=nl; $('lvDesc').textContent=lvDesc(nl); openTrain(genRhythm(nl)); };
+
+/* レベルナビ（ヘッダーの ‹ / › ボタン） */
+$('lvPrev').onclick=()=>{ if(!CUR||CUR.level<=1)return; const nl=CUR.level-1; DB.level=nl; save(); $('lvRange').value=nl; $('lvNum').textContent=nl; $('lvDesc').textContent=lvDesc(nl); openTrain(genRhythm(nl)); };
+$('lvNext').onclick=()=>{ if(!CUR||CUR.level>=30)return; const nl=CUR.level+1; DB.level=nl; save(); $('lvRange').value=nl; $('lvNum').textContent=nl; $('lvDesc').textContent=lvDesc(nl); openTrain(genRhythm(nl)); };
+
+/* カウントイン選択 */
+document.querySelectorAll('#countInSeg button').forEach(b=>b.onclick=()=>{ DB.countIn=+b.dataset.ci; save(); document.querySelectorAll('#countInSeg button').forEach(x=>x.classList.toggle('on',x===b)); });
+
+/* 録音再生（演奏録音 + クリック音を重ねて再生） */
+let recAudio=null, recClickTimer=null;
+function stopRecPlay(){
+  if(recAudio){ recAudio.pause(); recAudio.currentTime=0; recAudio=null; }
+  if(recClickTimer){ clearTimeout(recClickTimer); recClickTimer=null; }
+  $('recPlayBtn').style.display='';
+  $('recStopBtn').style.display='none';
+}
+$('recStopBtn').onclick=stopRecPlay;
+$('recPlayBtn').onclick=async()=>{
+  if(!SEQ.recUrl || !LAST || !CUR) return;
+  await ensureCtx();
+  stopRecPlay();
+
+  const rhythm=CUR, spb=LAST.spb, totalQ=rhythm.totalQ, groups=rhythm.groups, measures=rhythm.measures;
+  const ci=DB.countIn||1;
+
+  // 録音バッファの先頭 = SEQ.recStart（録音開始のAUコンテキスト時刻）に対応
+  // 再生開始時のAUコンテキスト時刻を基準に、各クリックのオフセットを計算
+  const playStartCtx = AU.ctx.currentTime + 0.05; // わずかな余裕
+
+  // 全クリックタイミング（カウントイン含む）を生成
+  // 録音内の時刻 = SEQ.recStart からの経過秒
+  // ボタン押下時の再生位置 = currentTime=0 → AUコンテキスト上では playStartCtx
+  for(let mi=0; mi<ci+measures; mi++){
+    let acc=0;
+    for(let gi=0; gi<groups.length; gi++){
+      const recRelT = (mi*totalQ+acc)*spb; // 録音バッファ先頭からの秒
+      const clickAt = playStartCtx + recRelT;
+      if(clickAt > AU.ctx.currentTime) click(clickAt, gi===0?'accent':'beat');
+      acc+=groups[gi];
+    }
+  }
+
+  // 演奏音を再生（クリックと同時に開始）
+  const delayMs = Math.max(0, (playStartCtx - AU.ctx.currentTime)*1000);
+  recAudio = new Audio(SEQ.recUrl);
+  recAudio.volume = 0.85;
+  recAudio.onended = stopRecPlay;
+  setTimeout(()=>{ if(recAudio) recAudio.play().catch(()=>{}); }, delayMs);
+
+  $('recPlayBtn').style.display='none';
+  $('recStopBtn').style.display='';
+  const dur = (ci+measures)*totalQ*spb;
+  recClickTimer = setTimeout(stopRecPlay, delayMs + dur*1000 + 600);
+};
 $('playBtn').onclick=async()=>{ if(!CUR)return; await startSeq(CUR,{record:true,guide:DB.guide},()=>{ LAST={events:SEQ.events.slice(),rhythmStart:SEQ.rhythmStart,spb:SEQ.spb}; applyResult(true); }); };
 document.querySelectorAll('#modeSeg button').forEach(b=>b.onclick=()=>{ DB.mode=b.dataset.m; save(); document.querySelectorAll('#modeSeg button').forEach(x=>x.classList.toggle('on',x===b)); if(LAST) applyResult(false); });
 $('guideTog').onchange=e=>{ DB.guide=e.target.checked; save(); };
@@ -712,7 +821,14 @@ function applyResult(saveLog){
   $('rHit').textContent=R.hit+'/'+R.n+' ('+R.hitRate+'%)';
   $('rExtra').textContent=R.extra;
   $('result').classList.add('on');
+  $('recPlayback').classList.remove('on');
+  // MediaRecorder.onstop は非同期なので、録音データが揃うまで少し待って表示
   if(saveLog){
+    const waitRec=()=>{
+      if(SEQ.recUrl){ $('recPlayback').classList.add('on'); }
+      else if(SEQ.mr){ setTimeout(waitRec,100); }
+    };
+    setTimeout(waitRec,150);
     DB.logs.unshift({ts:Date.now(),id:CUR.id,level:CUR.level,bpm:CUR.bpm,sig:CUR.sig,measures:CUR.measures,totalQ:CUR.totalQ,notes:CUR.notes,mode:DB.mode,score:R.score,avgAbs:R.avgAbs,avgSigned:R.avgSigned,hitRate:R.hitRate});
     if(DB.logs.length>200) DB.logs.length=200; save();
   }
