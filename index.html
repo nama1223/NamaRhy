@@ -422,7 +422,7 @@ function renderScore(rhythm, results){
   let perLine = W>=620?4 : W>=460?(maxN>8?2:3) : (maxN>6?1:2);
   perLine=Math.min(perLine,measures);
   const lines=Math.ceil(measures/perLine);
-  const padL=30,padR=8,top=30,lineH=STEM+50, usable=W-padL-padR, mW=usable/perLine;
+  const padL=30,padR=8,top=30,lineH=STEM+54, usable=W-padL-padR, mW=usable/perLine;
   const H=top+lines*lineH+14;
   const boxes=[];
   let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}">`;
@@ -458,9 +458,7 @@ function renderScore(rhythm, results){
       s+=`<line x1="${sx}" y1="${y-SS*0.2}" x2="${sx}" y2="${syTop}" stroke="#111" stroke-width="1.6"/>`;
       if(isDot(w)) s+=`<circle cx="${x+SS*1.05}" cy="${y-SS*0.4}" r="${SS*0.16}" fill="${col}"/>`;
       if(!beamOf.has(n)){ const c=nFlags(w); if(c>=1) s+=mt(sx,syTop,flagChar(c),'#111','start'); }
-      if(res){ const idx=mn.indexOf(n), gl=idx>0?x-X(mn[idx-1]):999, gr=idx<mn.length-1?X(mn[idx+1])-x:999;
-        if(Math.min(gl,gr)>=16){ const lab=res.ms===null?'×':((res.ms>0?'+':'')+res.ms); const yo=(idx%2?SS*3.3:SS*2.1);
-          s+=`<text x="${x}" y="${y+yo}" fill="${res.color}" text-anchor="middle" font-family="system-ui" font-size="8" font-weight="700">${lab}</text>`; } }
+      if(res){ const lab=res.ms===null?'×':((res.ms>0?'+':'')+res.ms), yo=SS*1.9+(ni%3)*SS; s+=`<text x="${x}" y="${y+yo}" fill="${res.color}" text-anchor="middle" font-family="system-ui" font-size="7.5" font-weight="700">${lab}</text>`; }
       ni++;
     }
     // ビーム
@@ -597,8 +595,8 @@ async function startSeq(rhythm,{record,guide},onFinish){
   if(record){ detector.reset(); detector.onOnset=t=>SEQ.events.push({onset:t,peak:null}); detector.onPeak=t=>{ for(let i=SEQ.events.length-1;i>=0;i--){ if(SEQ.events[i].peak===null){SEQ.events[i].peak=t;break;} } }; }
   else { detector.onOnset=null; detector.onPeak=null; }
   try{ if(navigator.wakeLock) SEQ.wake=await navigator.wakeLock.request('screen'); }catch(e){}
-  $('result').classList.remove('on'); $('playhead').style.display='none';
-  setBusy(true);
+  RES=null; renderScore(rhythm); $('result').classList.remove('on'); $('playhead').style.display='none';
+  setBusy(true); if($('s-train').classList.contains('on'))scrollScoreTop();
   SEQ.timer=setInterval(seqTick,25);
   SEQ.raf=requestAnimationFrame(seqDraw);
 }
@@ -624,7 +622,7 @@ function seqDraw(){
       ph.style.display='block';
       ph.style.left=(x*scale)+'px';
       ph.style.top=((bx.y-(LAYOUT.stem+14))*scale)+'px';
-      ph.style.height=((LAYOUT.stem+24)*scale)+'px';
+      ph.style.height=((LAYOUT.stem+24)*scale)+'px'; { const sb=document.querySelector('.scorebox'); if(sb){ const dz=sb.getBoundingClientRect().top+window.scrollY+(bx.y-(LAYOUT.stem+14))*scale-110; if(dz>window.scrollY+1) window.scrollTo(0, window.scrollY+Math.max(1,(dz-window.scrollY)*0.12)); } }
     }
   }
   SEQ.raf=requestAnimationFrame(seqDraw);
@@ -672,7 +670,7 @@ function show(id){
 }
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('on'); clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove('on'),2200); }
 function setBusy(b){ ['playBtn','listenBtn','newBtn2','againBtn','newBtn','nextBtn'].forEach(id=>{const e=$(id); if(e)e.disabled=b;}); $('stopBtn').disabled=!b; }
-function reRender(){ if(CUR && $('s-train').classList.contains('on')) renderScore(CUR,RES); }
+function reRender(){ if(CUR && $('s-train').classList.contains('on')) renderScore(CUR,RES); } function scrollScoreTop(){ const sb=document.querySelector('.scorebox'); if(!sb)return; const t=sb.getBoundingClientRect().top+window.scrollY-66; window.scrollTo(0,Math.max(0,t)); }
 
 /* ホーム */
 $('lvRange').addEventListener('input',e=>{ const l=+e.target.value; $('lvNum').textContent=l; $('lvDesc').textContent=lvDesc(l); DB.level=l; save(); });
