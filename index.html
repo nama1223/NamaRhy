@@ -6,6 +6,10 @@
 <meta name="theme-color" content="#f3f5fb">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="NamaRhy">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="NamaRhy192.png">
+<link rel="apple-touch-icon" href="NamaRhy192.png">
 <title>NamaRhy</title>
 <style>
 @font-face{ font-family:'Bravura'; src:url('Bravura.woff2') format('woff2'); font-display:swap; }
@@ -785,6 +789,24 @@ initHome();
 detector.setSens(DB.sens);
 if(document.fonts && document.fonts.load){ document.fonts.load('36px Bravura').then(reRender).catch(()=>{}); }
 window.addEventListener('resize',reRender);
+
+/* ---- PWA: Service Worker 登録＋自動更新リロード ---- */
+if('serviceWorker' in navigator){
+  const hadController=!!navigator.serviceWorker.controller;
+  let refreshing=false;
+  const doReload=()=>{ if(!refreshing){ refreshing=true; location.reload(); } };
+  navigator.serviceWorker.addEventListener('message',ev=>{ if(ev.data&&ev.data.type==='NR_UPDATE') doReload(); });
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{ if(hadController) doReload(); });
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('sw.js').then(reg=>{
+      const check=()=>{ if(navigator.onLine){ reg.update().catch(()=>{}); fetch('./',{cache:'no-store'}).catch(()=>{}); } };
+      check();
+      window.addEventListener('online',check);
+      document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') check(); });
+      setInterval(check,300000);
+    }).catch(()=>{});
+  });
+}
 </script>
 </body>
 </html>

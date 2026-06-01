@@ -1,0 +1,19 @@
+{
+  "id": "./",
+  "name": "NamaRhy",
+  "short_name": "NamaRhy",
+  "description": "管楽器のためのリズム採点トレーナー（音程は自由・タイミングだけを判定）",
+  "lang": "ja",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#eef1f8",
+  "theme_color": "#f3f5fb",
+  "icons": [
+    { "src": "NamaRhy192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "NamaRhy512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "NamaRhy1024.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any" }
+  ]
+}
