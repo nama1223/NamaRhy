@@ -675,14 +675,14 @@ const AU={ctx:null,master:null,node:null,analyser:null,stream:null,src:null,mute
    fluxMult   : fluxThresh = median * fluxMult
 */
 const INSTR_PRESETS={
-  generic:  { threshOn:0.05, threshOff:0.025, minIOI:0.075, peakWin:0.12, useDip:false, dipRatio:0.55, dipRise:1.25, fluxBand:[0.33,1.0], fluxMult:3.0 },
-  brass:    { threshOn:0.04, threshOff:0.018, minIOI:0.070, peakWin:0.10, useDip:true,  dipRatio:0.60, dipRise:1.20, fluxBand:[0.10,0.50], fluxMult:2.5 },
-  woodwind: { threshOn:0.04, threshOff:0.020, minIOI:0.065, peakWin:0.10, useDip:false, dipRatio:0.55, dipRise:1.25, fluxBand:[0.25,0.85], fluxMult:2.5 },
-  reed:     { threshOn:0.04, threshOff:0.020, minIOI:0.065, peakWin:0.10, useDip:true,  dipRatio:0.58, dipRise:1.22, fluxBand:[0.20,0.80], fluxMult:2.8 },
-  string:   { threshOn:0.04, threshOff:0.018, minIOI:0.060, peakWin:0.08, useDip:false, dipRatio:0.50, dipRise:1.30, fluxBand:[0.20,0.80], fluxMult:2.5 },
-  piano:    { threshOn:0.05, threshOff:0.022, minIOI:0.060, peakWin:0.08, useDip:false, dipRatio:0.50, dipRise:1.30, fluxBand:[0.15,0.75], fluxMult:3.0 },
-  perc:     { threshOn:0.06, threshOff:0.025, minIOI:0.050, peakWin:0.06, useDip:false, dipRatio:0.40, dipRise:1.40, fluxBand:[0.10,1.0],  fluxMult:2.0 },
-  voice:    { threshOn:0.04, threshOff:0.018, minIOI:0.080, peakWin:0.12, useDip:false, dipRatio:0.55, dipRise:1.25, fluxBand:[0.20,0.70], fluxMult:2.8 },
+  generic:  { threshOn:0.05, threshOff:0.025, minIOI:0.075, peakWin:0.12, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.33,1.0], fluxMult:3.0 },
+  brass:    { threshOn:0.04, threshOff:0.018, minIOI:0.070, peakWin:0.10, useDip:true,  dipRatio:0.32, dipRise:1.55, fluxBand:[0.10,0.50], fluxMult:2.5 },
+  woodwind: { threshOn:0.04, threshOff:0.020, minIOI:0.065, peakWin:0.10, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.25,0.85], fluxMult:2.5 },
+  reed:     { threshOn:0.04, threshOff:0.020, minIOI:0.065, peakWin:0.10, useDip:true,  dipRatio:0.33, dipRise:1.52, fluxBand:[0.20,0.80], fluxMult:2.8 },
+  string:   { threshOn:0.04, threshOff:0.018, minIOI:0.060, peakWin:0.08, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.20,0.80], fluxMult:2.5 },
+  piano:    { threshOn:0.05, threshOff:0.022, minIOI:0.060, peakWin:0.08, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.15,0.75], fluxMult:3.0 },
+  perc:     { threshOn:0.06, threshOff:0.025, minIOI:0.050, peakWin:0.06, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.10,1.0],  fluxMult:2.0 },
+  voice:    { threshOn:0.04, threshOff:0.018, minIOI:0.080, peakWin:0.12, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.20,0.70], fluxMult:2.8 },
 };
 const INSTR_LABELS={
   generic:'汎用（デフォルト）', brass:'金管楽器（トランペット・ホルン・ユーフォ・トロンボーン・チューバ等）',
@@ -708,7 +708,7 @@ const detector={
   reset(){
     this.inNote=false; this.lastOnset=-1; this.peakLocked=true;
     this.fluxHistory=[]; this.rmsHistory=[];
-    this.inDip=false; this.dipMin=1e9;
+    this.inDip=false; this.dipMin=1e9; this.dipPeak=0;
   },
 
   setInstrument(key){
@@ -732,7 +732,7 @@ const detector={
   feed(t, rms, flux, fluxBinLo, fluxBinHi){
     if(this.onLevel) this.onLevel(rms);
 
-    // RMS履歴を蓄積
+    // RMS履歴を蓄積（ディップ検出の安定化用）
     this.rmsHistory.push({t, v:rms});
     if(this.rmsHistory.length>this.rmsHistLen) this.rmsHistory.shift();
 
@@ -751,45 +751,62 @@ const detector={
 
     if(!this.inNote){
       // ── 通常オンセット検出 ──
-      if((rmsOk || fluxHit) && (t-this.lastOnset)>this.minIOI){
+      if((rmsOk || fluxHit) && (t - this.lastOnset) > this.minIOI){
         this._triggerOnset(t, rms);
       }
     } else {
-      // ── inNote=true の間 ──
+      // ── 発音中 ──
+
+      // ピーク追跡（peakLocked前のみ）
       if(!this.peakLocked){
-        if(rms>this.peakVal){ this.peakVal=rms; this.peakTime=t; }
-        if(t-this.onsetTime>=this.peakWin){ this.peakLocked=true; if(this.onPeak) this.onPeak(this.peakTime); }
+        if(rms > this.peakVal){ this.peakVal=rms; this.peakTime=t; }
+        if(t - this.onsetTime >= this.peakWin){
+          this.peakLocked=true;
+          if(this.onPeak) this.onPeak(this.peakTime);
+          // ピーク確定時点でディップ監視を開始するため、ここでdipPeakを記録
+          this.dipPeak = this.peakVal;
+          this.dipMin  = this.peakVal;
+          this.dipMinT = t;
+          this.inDip   = false;
+        }
       }
 
-      // タンギングディップ検出（金管・ダブルリード）
-      if(this.useDip && this.peakVal>0){
-        const dipThresh=this.peakVal*this.dipRatio;
+      // タンギングディップ検出：ピーク確定後のみ実施
+      // 条件：ピーク値から大きく落ち込み（dipRatio以下）→ 底から大きく回復（dipRise倍）
+      if(this.useDip && this.peakLocked && this.dipPeak > 0){
+        const dipThresh = this.dipPeak * this.dipRatio; // 例：ピーク値の32%以下
+
         if(!this.inDip){
-          // ピーク後に音量が dipRatio 以下まで落ちたらディップ開始
-          if(rms < dipThresh && (t-this.lastOnset)>this.minIOI*0.5){
-            this.inDip=true; this.dipMin=rms; this.dipMinT=t;
+          // ディップ開始：音量がdipThresh以下 かつ minIOI経過済み
+          if(rms <= dipThresh && (t - this.lastOnset) > this.minIOI){
+            this.inDip   = true;
+            this.dipMin  = rms;
+            this.dipMinT = t;
           }
         } else {
-          // ディップ中：さらに下がるか追跡
-          if(rms<this.dipMin){ this.dipMin=rms; this.dipMinT=t; }
-          // 底から dipRise 倍まで上昇したらタンギングとして新しいオンセット検出
-          if(rms >= this.dipMin*this.dipRise && rms >= this.threshOn*0.5){
-            this.inDip=false;
-            if((t-this.lastOnset)>this.minIOI){
-              // peakをロック（前の音の終端）してから新しいオンセット
-              if(!this.peakLocked){ this.peakLocked=true; if(this.onPeak) this.onPeak(this.peakTime); }
-              this.inNote=false;
-              this._triggerOnset(this.dipMinT, this.dipMin); // ディップ最低点をオンセット時刻に
-            }
+          // ディップ追跡：さらに下がるなら更新
+          if(rms < this.dipMin){ this.dipMin=rms; this.dipMinT=t; }
+
+          // 回復判定：底から dipRise 倍以上 かつ threshOn*0.7 以上 かつ minIOI経過
+          const recovered = rms >= this.dipMin * this.dipRise
+                         && rms >= this.threshOn * 0.7
+                         && (t - this.lastOnset) > this.minIOI;
+          if(recovered){
+            this.inDip = false;
+            // 新しいタンギングとして検出（ディップ最低点をオンセット時刻とする）
+            this.inNote = false;
+            this.dipPeak = 0; // リセット
+            this._triggerOnset(this.dipMinT, rms);
           }
-          // ディップから戻らず完全に消音した場合
-          if(rms<this.threshOff){ this.inDip=false; }
+
+          // ディップから消音に至った場合はリセット
+          if(rms < this.threshOff){ this.inDip=false; this.dipPeak=0; }
         }
       }
 
       // 完全消音
-      if(rms<this.threshOff){
-        this.inNote=false; this.inDip=false;
+      if(rms < this.threshOff){
+        this.inNote=false; this.inDip=false; this.dipPeak=0;
         if(!this.peakLocked){ this.peakLocked=true; if(this.onPeak) this.onPeak(this.peakTime); }
       }
     }
@@ -798,7 +815,7 @@ const detector={
   _triggerOnset(t, rms){
     this.inNote=true; this.onsetTime=t; this.lastOnset=t;
     this.peakVal=rms; this.peakTime=t; this.peakLocked=false;
-    this.inDip=false; this.dipMin=1e9;
+    this.inDip=false; this.dipMin=1e9; this.dipPeak=0;
     if(this.onOnset) this.onOnset(t);
   }
 };
@@ -992,7 +1009,11 @@ function scoreTake(rhythm, events, rhythmStart, spb, mode, calib){
       per[i]={ms,color:v.color}; sum+=Math.max(0,100-Math.abs(ms)/2); abs+=Math.abs(ms); signed+=ms; hit++;
     } else { per[i]={ms:null,color:verdict(null).color}; }
   });
-  const n=exp.length, extra=used.filter(u=>!u).length;
+  const n=exp.length;
+  // extra = 検出された音のうち、どの期待音符にもマッチしなかった数
+  // ただし det.length が n 以下なら余分音なし（音抜けがあるケース）
+  const rawExtra = det.length - hit;
+  const extra = Math.max(0, rawExtra);
   return {per, score:Math.round(n?sum/n:0), n, hit, extra, avgAbs:hit?Math.round(abs/hit):0, avgSigned:hit?Math.round(signed/hit):0, hitRate:n?Math.round(hit/n*100):0};
 }
 function grade(s){ return s>=95?'S 完璧なグルーヴ！':s>=85?'A とても正確':s>=70?'B 良い感じ':s>=55?'C もう一歩':s>=35?'D 練習しよう':'E まずはお手本から'; }
