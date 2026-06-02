@@ -442,11 +442,59 @@ function mt(x,y,ch,fill,anchor){ return `<text x="${x}" y="${y}" font-family="Br
 function groupIndexOf(o,groups){ let acc=0; for(let i=0;i<groups.length;i++){ if(o<acc+groups[i]-1e-9) return i; acc+=groups[i]; } return groups.length-1; }
 
 let LAYOUT=null;
+
+/* 付点音符が拍をまたぐ際、またいだ先が長い場合に分割してタイで表示する
+   例：拍境界から 1/4 手前に付点8分 → 16分＋8分のタイに分解 */
+function splitDotsAcrossBeats(notes, groups, totalQ){
+  // 拍境界リストを生成（小節先頭からのオフセット）
+  const boundaries=[];
+  let bacc=0;
+  for(const g of groups){ boundaries.push(bacc); bacc+=g; }
+  boundaries.push(bacc); // 小節末
+
+  const out=[];
+  for(const n of notes){
+    if(n.rest || n.trip){ out.push(n); continue; }
+    const w=n.d; // 実際の長さ（4分音符=1単位）
+    // 付点音符か判定（付点8分=0.75, 付点4分=1.5, 付点2分=3）
+    const isDotted=Math.abs(w-0.75)<1e-6||Math.abs(w-1.5)<1e-6||Math.abs(w-3)<1e-6;
+    if(!isDotted){ out.push(n); continue; }
+
+    // この音符が属する小節内のオフセット
+    const mStart = n.m * totalQ;
+    const localStart = n.b - mStart; // 小節内開始位置
+    const localEnd   = localStart + w;
+
+    // またいでいる拍境界を探す（小節末は除く）
+    let crossBeat = -1;
+    for(let i=1;i<boundaries.length-1;i++){
+      const bnd=boundaries[i];
+      if(bnd > localStart + 1e-6 && bnd < localEnd - 1e-6){
+        crossBeat = bnd; break;
+      }
+    }
+    if(crossBeat < 0){ out.push(n); continue; }
+
+    const before = crossBeat - localStart; // 境界手前の長さ
+    const after  = localEnd  - crossBeat;  // 境界後の長さ
+
+    // 「またいだ先の方が長い」場合だけ分割
+    if(after <= before + 1e-6){ out.push(n); continue; }
+
+    // 分割して2つのノートを生成（tieStart/tieEnd フラグ付き）
+    out.push({ ...n, d:before, tieStart:true });
+    out.push({ ...n, b:mStart+crossBeat, d:after, m:n.m, tieEnd:true });
+  }
+  return out;
+}
+
 function renderScore(rhythm, results){
   const box=$('score');
   const W=Math.max(280, box.clientWidth || (box.parentElement?box.parentElement.clientWidth-8:340));
   const {notes,measures,totalQ,groups,meter}=rhythm;
-  let maxN=0; for(let m=0;m<measures;m++){ const c=notes.filter(n=>n.m===m&&!n.rest).length; if(c>maxN)maxN=c; }
+  // 付点音符分割（描画用のみ：採点には元のnotesを使う）
+  const dispNotes=splitDotsAcrossBeats(notes,groups,totalQ);
+  let maxN=0; for(let m=0;m<measures;m++){ const c=dispNotes.filter(n=>n.m===m&&!n.rest).length; if(c>maxN)maxN=c; }
   let perLine = W>=620?4 : W>=460?(maxN>8?2:3) : (maxN>6?1:2);
   perLine=Math.min(perLine,measures);
   const lines=Math.ceil(measures/perLine);
@@ -454,6 +502,9 @@ function renderScore(rhythm, results){
   const H=top+lines*lineH+14;
   const boxes=[];
   let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}">`;
+  // 採点indexは元のnotes（tieEnd=falseのみ）に対応するためのマッピング
+  // resultsのindexは元のnotes中の非休符音符順
+  // dispNotes上でtieEndはresultsを消費しない
   let ni=0;
   for(let m=0;m<measures;m++){
     const line=Math.floor(m/perLine), col=m%perLine;
@@ -464,7 +515,7 @@ function renderScore(rhythm, results){
     if(col===0) s+=`<line x1="${x0}" y1="${y-22}" x2="${x0}" y2="${y+9}" stroke="#5a6079" stroke-width="1.4"/>`;
     // 拍グループの目盛り
     let gacc=0; for(let gi=0;gi<groups.length-1;gi++){ gacc+=groups[gi]; const gx=x0+PAD*mW+(gacc/totalQ)*AREA*mW; s+=`<line x1="${gx}" y1="${y-4}" x2="${gx}" y2="${y+4}" stroke="#d7dcea" stroke-width="1"/>`; }
-    const mn=notes.filter(n=>n.m===m).sort((a,b)=>a.b-b.b);
+    const mn=dispNotes.filter(n=>n.m===m).sort((a,b)=>a.b-b.b);
     const X=n=>x0+PAD*mW+((n.b-m*totalQ)/totalQ)*AREA*mW;
     const stemX=n=>X(n)+SS*0.55;
     // ビームグループ（連続する連桁可能音符・同拍グループ or 同連符・休符で分断）
@@ -480,14 +531,27 @@ function renderScore(rhythm, results){
     for(const n of mn){
       const x=X(n), w=wdur(n);
       if(n.rest){ s+=mt(x, y-(w>=2?SS*0.5:0), restChar(w), '#2a2f45'); if(isDot(w)) s+=`<circle cx="${x+SS*0.95}" cy="${y-SS*0.4}" r="${SS*0.16}" fill="#2a2f45"/>`; continue; }
-      const res=results?results[ni]:null, col=res?res.color:'#111';
-      s+=mt(x,y,headChar(w),col);
+      // tieEnd は採点index（ni）を消費しない（元のnotesには存在しない）
+      const res = (!n.tieEnd && results) ? results[ni] : null;
+      const col2=res?res.color:(n.tieEnd?'#555':'#111');
+      s+=mt(x,y,headChar(w),col2);
       const sx=stemX(n), syTop=y-STEM;
       s+=`<line x1="${sx}" y1="${y-SS*0.2}" x2="${sx}" y2="${syTop}" stroke="#111" stroke-width="1.6"/>`;
-      if(isDot(w)) s+=`<circle cx="${x+SS*1.05}" cy="${y-SS*0.4}" r="${SS*0.16}" fill="${col}"/>`;
+      // tieEnd側は付点なし（分割されているので）
+      if(!n.tieEnd && isDot(w)) s+=`<circle cx="${x+SS*1.05}" cy="${y-SS*0.4}" r="${SS*0.16}" fill="${col2}"/>`;
       if(!beamOf.has(n)){ const c=nFlags(w); if(c>=1) s+=mt(sx,syTop,flagChar(c),'#111','start'); }
+      // タイ弧の描画（tieStartとtieEndのペアを同一小節内で結ぶ）
+      if(n.tieStart){
+        // tieEndはこの直後に来るはず
+        const nextTieEnd=mn.find(nn=>nn.tieEnd && Math.abs(nn.b-(n.b+n.d))<1e-6);
+        if(nextTieEnd){
+          const tx1=x+SS*0.8, tx2=X(nextTieEnd)+SS*0.3, ty=y+SS*0.7;
+          const mx=(tx1+tx2)/2;
+          s+=`<path d="M${tx1},${ty} Q${mx},${ty+SS*0.9} ${tx2},${ty}" fill="none" stroke="#555" stroke-width="1.3"/>`;
+        }
+      }
       if(res){ const lab=res.ms===null?'×':((res.ms>0?'+':'')+res.ms), yo=SS*1.9+(ni%3)*SS; s+=`<text x="${x}" y="${y+yo}" fill="${res.color}" text-anchor="middle" font-family="system-ui" font-size="7.5" font-weight="700">${lab}</text>`; }
-      ni++;
+      if(!n.tieEnd) ni++;
     }
     // ビーム
     for(const g of grp){ if(g.arr.length<2) continue;
@@ -689,9 +753,16 @@ function scoreTake(rhythm, events, rhythmStart, spb, mode, calib){
   const off=(typeof calib==='number')?calib:0;
   const exp=rhythm.notes.filter(n=>!n.rest).map(n=>({t:rhythmStart+n.b*spb}));
   const det=events.map(e=>{ const v=mode==='peak'?(e.peak??e.onset):e.onset; return v==null?null:v-off; }).filter(v=>v!=null).sort((a,b)=>a-b);
-  const win=Math.min(0.28, spb*0.55), used=new Array(det.length).fill(false), per=[];
+  // 判定ウィンドウ：隣接する期待音符間隔の半分と固定上限の小さい方
+  // 連続した音符では小さくなり、誤マッチ（音抜け）を防ぐ
+  const baseWin=Math.min(0.22, spb*0.48);
+  const used=new Array(det.length).fill(false), per=[];
   let sum=0,abs=0,hit=0,signed=0;
   exp.forEach((E,i)=>{
+    // 前後の期待音符との距離から動的ウィンドウを計算
+    const prevGap = i>0 ? (E.t-exp[i-1].t)/2 : baseWin;
+    const nextGap = i<exp.length-1 ? (exp[i+1].t-E.t)/2 : baseWin;
+    const win = Math.min(baseWin, Math.max(prevGap, nextGap));
     let best=-1,bd=1e9;
     for(let j=0;j<det.length;j++){ if(used[j])continue; const dd=Math.abs(det[j]-E.t); if(dd<bd){bd=dd;best=j;} }
     if(best>=0 && bd<=win){
@@ -761,51 +832,69 @@ $('lvNext').onclick=()=>{ if(!CUR||CUR.level>=30)return; const nl=CUR.level+1; D
 /* カウントイン選択 */
 document.querySelectorAll('#countInSeg button').forEach(b=>b.onclick=()=>{ DB.countIn=+b.dataset.ci; save(); document.querySelectorAll('#countInSeg button').forEach(x=>x.classList.toggle('on',x===b)); });
 
-/* 録音再生（演奏録音 + クリック音を重ねて再生） */
-let recAudio=null, recClickTimer=null;
+/* 録音再生（AudioContext でデコード → BufferSourceNode で完全同期再生） */
+let recSrc=null, recGain=null, recClickNodes=[], recEndTimer=null;
 function stopRecPlay(){
-  if(recAudio){ recAudio.pause(); recAudio.currentTime=0; recAudio=null; }
-  if(recClickTimer){ clearTimeout(recClickTimer); recClickTimer=null; }
+  // BufferSource停止
+  if(recSrc){ try{recSrc.stop();}catch(e){} recSrc=null; }
+  if(recGain){ try{recGain.disconnect();}catch(e){} recGain=null; }
+  // スケジュール済みクリックOscillator全停止
+  recClickNodes.forEach(o=>{ try{o.stop();}catch(e){} });
+  recClickNodes=[];
+  if(recEndTimer){ clearTimeout(recEndTimer); recEndTimer=null; }
   $('recPlayBtn').style.display='';
   $('recStopBtn').style.display='none';
 }
 $('recStopBtn').onclick=stopRecPlay;
 $('recPlayBtn').onclick=async()=>{
-  if(!SEQ.recUrl || !LAST || !CUR) return;
+  if(!SEQ.recBlob || !LAST || !CUR) return;
   await ensureCtx();
   stopRecPlay();
 
+  // Blob → ArrayBuffer → AudioBuffer（デコード）
+  let audioBuf;
+  try{
+    const ab = await SEQ.recBlob.arrayBuffer();
+    audioBuf = await AU.ctx.decodeAudioData(ab);
+  }catch(e){ toast('録音の再生に失敗しました'); return; }
+
   const rhythm=CUR, spb=LAST.spb, totalQ=rhythm.totalQ, groups=rhythm.groups, measures=rhythm.measures;
   const ci=DB.countIn||1;
+  const playStartCtx = AU.ctx.currentTime + 0.08;
 
-  // 録音バッファの先頭 = SEQ.recStart（録音開始のAUコンテキスト時刻）に対応
-  // 再生開始時のAUコンテキスト時刻を基準に、各クリックのオフセットを計算
-  const playStartCtx = AU.ctx.currentTime + 0.05; // わずかな余裕
+  // 演奏音をBufferSourceNodeで再生（AudioContextに乗るので完全同期）
+  recGain = AU.ctx.createGain(); recGain.gain.value=0.85; recGain.connect(AU.master);
+  recSrc = AU.ctx.createBufferSource(); recSrc.buffer=audioBuf;
+  recSrc.connect(recGain);
+  recSrc.onended=()=>{ if(recSrc) stopRecPlay(); };
+  recSrc.start(playStartCtx);
 
-  // 全クリックタイミング（カウントイン含む）を生成
-  // 録音内の時刻 = SEQ.recStart からの経過秒
-  // ボタン押下時の再生位置 = currentTime=0 → AUコンテキスト上では playStartCtx
+  // クリックをスケジュール（同じAudioContextタイムライン上）
+  recClickNodes=[];
   for(let mi=0; mi<ci+measures; mi++){
     let acc=0;
     for(let gi=0; gi<groups.length; gi++){
-      const recRelT = (mi*totalQ+acc)*spb; // 録音バッファ先頭からの秒
-      const clickAt = playStartCtx + recRelT;
-      if(clickAt > AU.ctx.currentTime) click(clickAt, gi===0?'accent':'beat');
+      const clickAt = playStartCtx + (mi*totalQ+acc)*spb;
+      // clickの戻り値（Oscillator）を保持して停止できるよう、内部で生成
+      const o=AU.ctx.createOscillator(), g=AU.ctx.createGain();
+      const kind=gi===0?'accent':'beat';
+      o.type='square';
+      o.frequency.value=kind==='accent'?2000:1300;
+      const peak=kind==='accent'?0.5:0.3;
+      g.gain.setValueAtTime(0.0001,clickAt);
+      g.gain.exponentialRampToValueAtTime(peak,clickAt+0.002);
+      g.gain.exponentialRampToValueAtTime(0.0001,clickAt+0.045);
+      o.connect(g).connect(AU.master);
+      o.start(clickAt); o.stop(clickAt+0.08);
+      recClickNodes.push(o);
       acc+=groups[gi];
     }
   }
 
-  // 演奏音を再生（クリックと同時に開始）
-  const delayMs = Math.max(0, (playStartCtx - AU.ctx.currentTime)*1000);
-  recAudio = new Audio(SEQ.recUrl);
-  recAudio.volume = 0.85;
-  recAudio.onended = stopRecPlay;
-  setTimeout(()=>{ if(recAudio) recAudio.play().catch(()=>{}); }, delayMs);
-
   $('recPlayBtn').style.display='none';
   $('recStopBtn').style.display='';
-  const dur = (ci+measures)*totalQ*spb;
-  recClickTimer = setTimeout(stopRecPlay, delayMs + dur*1000 + 600);
+  const dur=(ci+measures)*totalQ*spb;
+  recEndTimer=setTimeout(stopRecPlay, (playStartCtx-AU.ctx.currentTime+dur+0.5)*1000);
 };
 $('playBtn').onclick=async()=>{ if(!CUR)return; await startSeq(CUR,{record:true,guide:DB.guide},()=>{ LAST={events:SEQ.events.slice(),rhythmStart:SEQ.rhythmStart,spb:SEQ.spb}; applyResult(true); }); };
 document.querySelectorAll('#modeSeg button').forEach(b=>b.onclick=()=>{ DB.mode=b.dataset.m; save(); document.querySelectorAll('#modeSeg button').forEach(x=>x.classList.toggle('on',x===b)); if(LAST) applyResult(false); });
