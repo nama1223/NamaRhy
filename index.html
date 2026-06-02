@@ -247,15 +247,75 @@ small.note{display:block;color:var(--sub);font-size:11.5px;margin-top:8px;line-h
 </main>
 <div class="toast" id="toast"></div>
 
-<!-- AudioWorklet: ブロックごとのRMSをメインスレッドへ送るだけ（検出はJS側） -->
+<!-- AudioWorklet: RMS + Spectral Flux をメインスレッドへ送る（管楽器タンギング対応） -->
 <script id="worklet" type="text/worklet">
 class RMSProc extends AudioWorkletProcessor{
+  constructor(){
+    super();
+    this._fftSize=256;
+    this._prevMag=new Float32Array(this._fftSize/2);
+    // 簡易FFT用バッファ（128サンプルブロックを蓄積）
+    this._buf=new Float32Array(this._fftSize);
+    this._bufPos=0;
+  }
+  // Cooley-Tukey FFT（実数入力・大きさのみ）
+  _fft(buf){
+    const N=buf.length;
+    const re=new Float32Array(N), im=new Float32Array(N);
+    for(let i=0;i<N;i++) re[i]=buf[i];
+    // ビット反転並べ替え
+    for(let i=1,j=0;i<N;i++){
+      let bit=N>>1;
+      for(;j&bit;bit>>=1) j^=bit;
+      j^=bit;
+      if(i<j){ let t=re[i];re[i]=re[j];re[j]=t; t=im[i];im[i]=im[j];im[j]=t; }
+    }
+    for(let len=2;len<=N;len<<=1){
+      const ang=-2*Math.PI/len;
+      const wRe=Math.cos(ang), wIm=Math.sin(ang);
+      for(let i=0;i<N;i+=len){
+        let curRe=1, curIm=0;
+        for(let j=0;j<len/2;j++){
+          const uRe=re[i+j], uIm=im[i+j];
+          const vRe=re[i+j+len/2]*curRe - im[i+j+len/2]*curIm;
+          const vIm=re[i+j+len/2]*curIm + im[i+j+len/2]*curRe;
+          re[i+j]=uRe+vRe; im[i+j]=uIm+vIm;
+          re[i+j+len/2]=uRe-vRe; im[i+j+len/2]=uIm-vIm;
+          const nRe=curRe*wRe-curIm*wIm;
+          curIm=curRe*wIm+curIm*wRe; curRe=nRe;
+        }
+      }
+    }
+    const mag=new Float32Array(N/2);
+    for(let i=0;i<N/2;i++) mag[i]=Math.sqrt(re[i]*re[i]+im[i]*im[i])/N;
+    return mag;
+  }
   process(inputs){
     const inp=inputs[0];
     if(inp && inp[0]){
-      const ch=inp[0]; let s=0;
-      for(let i=0;i<ch.length;i++){ const v=ch[i]; s+=v*v; }
-      this.port.postMessage({t:currentTime, rms:Math.sqrt(s/ch.length)});
+      const ch=inp[0];
+      // RMS計算
+      let s=0; for(let i=0;i<ch.length;i++) s+=ch[i]*ch[i];
+      const rms=Math.sqrt(s/ch.length);
+      // バッファに蓄積してFFTサイズになったらSpectral Flux計算
+      for(let i=0;i<ch.length;i++){
+        this._buf[this._bufPos++]=ch[i];
+        if(this._bufPos>=this._fftSize){
+          this._bufPos=0;
+          const mag=this._fft(this._buf);
+          // Spectral Flux: 正の増加成分のみ合計（HF成分 = 上位1/3のビン）
+          let flux=0;
+          const lo=Math.floor(mag.length/3);
+          for(let j=lo;j<mag.length;j++){
+            const diff=mag[j]-this._prevMag[j];
+            if(diff>0) flux+=diff;
+          }
+          this._prevMag.set(mag);
+          this.port.postMessage({t:currentTime, rms, flux});
+        }
+      }
+      // バッファが溜まっていない間もRMSは送る（flux=0）
+      if(this._bufPos>0) this.port.postMessage({t:currentTime, rms, flux:0});
     }
     return true;
   }
@@ -518,14 +578,24 @@ function renderScore(rhythm, results){
     const mn=dispNotes.filter(n=>n.m===m).sort((a,b)=>a.b-b.b);
     const X=n=>x0+PAD*mW+((n.b-m*totalQ)/totalQ)*AREA*mW;
     const stemX=n=>X(n)+SS*0.55;
-    // ビームグループ（連続する連桁可能音符・同拍グループ or 同連符・休符で分断）
-    const grp=[]; let cur=null; const beamable=n=>!n.rest && nFlags(wdur(n))>=1;
+    // ビームグループ：休符をまたいでも同拍グループなら連桁を維持
+    // （例：8分音符＋16分休符＋16分音符 → 連桁でつなぐ）
+    const grp=[]; let cur=null;
+    const beamable=n=>nFlags(wdur(n))>=1; // 音符・休符問わずフラグ数で判定
+    const isRealNote=n=>!n.rest && nFlags(wdur(n))>=1;
     for(const n of mn){
-      if(beamable(n)){ const key=n.trip?('t'+n.trip):('g'+groupIndexOf(n.b-m*totalQ,groups));
-        if(cur&&cur.key===key) cur.arr.push(n); else { cur={key,arr:[n]}; grp.push(cur);} }
-      else cur=null;
+      if(beamable(n)){
+        const key=n.trip?('t'+n.trip):('g'+groupIndexOf(n.b-m*totalQ,groups));
+        if(cur&&cur.key===key) cur.arr.push(n);
+        else { cur={key,arr:[n]}; grp.push(cur); }
+      } else cur=null;
     }
-    const beamOf=new Map(); grp.forEach(g=>{ if(g.arr.length>=2) g.arr.forEach(n=>beamOf.set(n,g)); });
+    // グループ内に実音符が2つ以上ある場合だけ連桁対象
+    const beamOf=new Map();
+    grp.forEach(g=>{
+      const realCount=g.arr.filter(isRealNote).length;
+      if(realCount>=2) g.arr.filter(isRealNote).forEach(n=>beamOf.set(n,g));
+    });
     const trips={}; for(const n of mn){ if(n.trip){(trips[n.trip]=trips[n.trip]||[]).push(n);} }
     // 音符
     for(const n of mn){
@@ -554,15 +624,17 @@ function renderScore(rhythm, results){
       if(!n.tieEnd) ni++;
     }
     // ビーム
-    for(const g of grp){ if(g.arr.length<2) continue;
-      const xs=g.arr.map(stemX), by=y-STEM;
+    for(const g of grp){
+      const realNotes=g.arr.filter(isRealNote);
+      if(realNotes.length<2) continue;
+      const xs=realNotes.map(stemX), by=y-STEM;
       s+=`<line x1="${xs[0]}" y1="${by}" x2="${xs[xs.length-1]}" y2="${by}" stroke="#111" stroke-width="${BEAMW}"/>`;
-      const lvl2=g.arr.map(n=>nFlags(wdur(n))>=2); let i=0;
-      while(i<g.arr.length){
+      const lvl2=realNotes.map(n=>nFlags(wdur(n))>=2); let i=0;
+      while(i<realNotes.length){
         if(!lvl2[i]){i++;continue;}
-        let j=i; while(j+1<g.arr.length&&lvl2[j+1])j++;
+        let j=i; while(j+1<realNotes.length&&lvl2[j+1])j++;
         if(j>i) s+=`<line x1="${xs[i]}" y1="${by+6}" x2="${xs[j]}" y2="${by+6}" stroke="#111" stroke-width="${BEAMW}"/>`;
-        else { const dir=(i===g.arr.length-1)?-1:1; s+=`<line x1="${xs[i]}" y1="${by+6}" x2="${xs[i]+dir*8}" y2="${by+6}" stroke="#111" stroke-width="${BEAMW}"/>`; }
+        else { const dir=(i===realNotes.length-1)?-1:1; s+=`<line x1="${xs[i]}" y1="${by+6}" x2="${xs[i]+dir*8}" y2="${by+6}" stroke="#111" stroke-width="${BEAMW}"/>`; }
         i=j+1;
       }
     }
@@ -588,23 +660,50 @@ function renderScore(rhythm, results){
 const AU={ctx:null,master:null,node:null,analyser:null,stream:null,src:null,mute:null,useWorklet:false,rafAnal:0,wlLoaded:false};
 const detector={
   threshOn:0.05, threshOff:0.025, minIOI:0.085, peakWin:0.14,
+  // Spectral Flux 関連
+  fluxThresh:0.012,      // flux閾値（setFluxThreshで自動調整）
+  fluxHistory:[],        // 直近fluxの履歴（ノイズフロア推定用）
+  fluxHistMax:30,
+  // 状態
   inNote:false,lastOnset:-1,peakVal:0,peakTime:0,onsetTime:0,peakLocked:true,
   onLevel:null,onOnset:null,onPeak:null,
-  reset(){this.inNote=false;this.lastOnset=-1;this.peakLocked=true;},
+  reset(){this.inNote=false;this.lastOnset=-1;this.peakLocked=true;this.fluxHistory=[];},
   setSens(s){ this.threshOn=Math.max(0.01, s/100*0.6); this.threshOff=this.threshOn*0.5; },
-  feed(t,rms){
-    if(this.onLevel)this.onLevel(rms);
+  feed(t, rms, flux){
+    if(this.onLevel) this.onLevel(rms);
+
+    // Flux のノイズフロアを適応推定（中央値ベース）
+    if(flux>0){
+      this.fluxHistory.push(flux);
+      if(this.fluxHistory.length>this.fluxHistMax) this.fluxHistory.shift();
+      if(this.fluxHistory.length>=8){
+        const sorted=[...this.fluxHistory].sort((a,b)=>a-b);
+        const median=sorted[Math.floor(sorted.length/2)];
+        // 閾値 = ノイズフロアの3倍（管楽器はタンギングで5〜10倍跳ね上がる）
+        this.fluxThresh=Math.max(0.008, median*3);
+      }
+    }
+
+    // オンセット判定：RMS閾値 OR (RMSが一定以上 AND Fluxが急増)
+    const rmsOk   = rms >= this.threshOn;
+    const fluxHit = flux > this.fluxThresh && rms >= this.threshOn * 0.4;
+    const triggered = rmsOk || fluxHit;
+
     if(!this.inNote){
-      if(rms>=this.threshOn && (t-this.lastOnset)>this.minIOI){
-        this.inNote=true;this.onsetTime=t;this.lastOnset=t;this.peakVal=rms;this.peakTime=t;this.peakLocked=false;
-        if(this.onOnset)this.onOnset(t);
+      if(triggered && (t-this.lastOnset)>this.minIOI){
+        this.inNote=true; this.onsetTime=t; this.lastOnset=t;
+        this.peakVal=rms; this.peakTime=t; this.peakLocked=false;
+        if(this.onOnset) this.onOnset(t);
       }
     } else {
       if(!this.peakLocked){
-        if(rms>this.peakVal){this.peakVal=rms;this.peakTime=t;}
-        if(t-this.onsetTime>=this.peakWin){this.peakLocked=true; if(this.onPeak)this.onPeak(this.peakTime);}
+        if(rms>this.peakVal){ this.peakVal=rms; this.peakTime=t; }
+        if(t-this.onsetTime>=this.peakWin){ this.peakLocked=true; if(this.onPeak) this.onPeak(this.peakTime); }
       }
-      if(rms<this.threshOff){ this.inNote=false; if(!this.peakLocked){this.peakLocked=true; if(this.onPeak)this.onPeak(this.peakTime);} }
+      if(rms<this.threshOff){
+        this.inNote=false;
+        if(!this.peakLocked){ this.peakLocked=true; if(this.onPeak) this.onPeak(this.peakTime); }
+      }
     }
   }
 };
@@ -630,14 +729,33 @@ async function buildInputGraph(){
     try{
       if(!AU.wlLoaded){ const url=URL.createObjectURL(new Blob([$('worklet').textContent],{type:'text/javascript'})); await AU.ctx.audioWorklet.addModule(url); AU.wlLoaded=true; }
       AU.node=new AudioWorkletNode(AU.ctx,'rms-proc');
-      AU.node.port.onmessage=e=>detector.feed(e.data.t,e.data.rms);
+      AU.node.port.onmessage=e=>detector.feed(e.data.t, e.data.rms, e.data.flux||0);
       AU.src.connect(AU.node); AU.node.connect(AU.mute); AU.useWorklet=true; return;
     }catch(e){}
   }
   AU.analyser=AU.ctx.createAnalyser(); AU.analyser.fftSize=512;
   AU.src.connect(AU.analyser); AU.analyser.connect(AU.mute);
   const buf=new Float32Array(AU.analyser.fftSize);
-  const loop=()=>{ AU.analyser.getFloatTimeDomainData(buf); let s=0; for(let i=0;i<buf.length;i++)s+=buf[i]*buf[i]; detector.feed(AU.ctx.currentTime,Math.sqrt(s/buf.length)); AU.rafAnal=requestAnimationFrame(loop); };
+  const fbuf=new Float32Array(AU.analyser.frequencyBinCount);
+  let prevFbuf=new Float32Array(AU.analyser.frequencyBinCount);
+  const loop=()=>{
+    AU.analyser.getFloatTimeDomainData(buf);
+    let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i];
+    const rms=Math.sqrt(s/buf.length);
+    AU.analyser.getFloatFrequencyData(fbuf);
+    // HF帯域（上位1/3）のスペクトルフラックス
+    let flux=0;
+    const lo=Math.floor(fbuf.length/3);
+    for(let i=lo;i<fbuf.length;i++){
+      // getFloatFrequencyData はdB値なのでリニアに変換
+      const cur=Math.pow(10, fbuf[i]/20);
+      const prv=Math.pow(10, prevFbuf[i]/20);
+      const diff=cur-prv; if(diff>0) flux+=diff;
+    }
+    prevFbuf.set(fbuf);
+    detector.feed(AU.ctx.currentTime, rms, flux);
+    AU.rafAnal=requestAnimationFrame(loop);
+  };
   loop();
 }
 async function ensureMic(){
@@ -688,7 +806,9 @@ async function startSeq(rhythm,{record,guide},onFinish){
   Object.assign(SEQ,{running:true,record,schedule:b.sch,si:0,startT:b.start,rhythmStart:b.rhythmStart,spb:b.spb,endT:b.endT,events:[],rhythm,onFinish,
     mr:null,mrChunks:[],recBlob:null,recUrl:null,recStart:b.start,recRhythmOffset:b.rhythmStart-b.start});
   if(record){ detector.reset(); detector.onOnset=t=>SEQ.events.push({onset:t,peak:null}); detector.onPeak=t=>{ for(let i=SEQ.events.length-1;i>=0;i--){ if(SEQ.events[i].peak===null){SEQ.events[i].peak=t;break;} } };
-    // MediaRecorder で演奏録音
+    // MediaRecorder：クリック開始（b.start）のちょうどに合わせてスタート
+    // b.start = AU.ctx.currentTime + 0.35 なので、その分だけ遅らせて録音開始
+    // → 録音バッファ先頭 ≒ 最初のクリック音のタイミング
     if(AU.stream && window.MediaRecorder){
       try{
         SEQ.mrChunks=[];
@@ -699,8 +819,12 @@ async function startSeq(rhythm,{record,guide},onFinish){
           SEQ.recBlob=new Blob(SEQ.mrChunks,{type:SEQ.mrChunks[0]?.type||'audio/webm'});
           SEQ.recUrl=URL.createObjectURL(SEQ.recBlob);
         };
-        SEQ.mr.start();
-      }catch(e){ SEQ.mr=null; }
+        // 0.35秒後（= 最初のクリックが鳴る直前）に録音開始
+        // → 録音バッファの t=0 ≒ 最初のクリック音
+        const preRollMs = Math.max(0, (b.start - AU.ctx.currentTime) * 1000 - 20);
+        SEQ.recPreRoll = preRollMs / 1000; // 秒単位で保存（聴き返し時のオフセット補正用）
+        setTimeout(()=>{ try{ if(SEQ.mr) SEQ.mr.start(); }catch(e){} }, preRollMs);
+      }catch(e){ SEQ.mr=null; SEQ.recPreRoll=0; }
     }
   }
   else { detector.onOnset=null; detector.onPeak=null; }
@@ -863,11 +987,14 @@ $('recPlayBtn').onclick=async()=>{
   const playStartCtx = AU.ctx.currentTime + 0.08;
 
   // 演奏音をBufferSourceNodeで再生（AudioContextに乗るので完全同期）
+  // recPreRoll = 録音開始を遅らせた秒数（= 最初のクリックまでのバッファ先頭オフセット）
+  // バッファのoffset=0から再生するとクリックと一致する
+  const bufOffset = 0; // recPreRoll分は遅延録音で吸収済み
   recGain = AU.ctx.createGain(); recGain.gain.value=0.85; recGain.connect(AU.master);
   recSrc = AU.ctx.createBufferSource(); recSrc.buffer=audioBuf;
   recSrc.connect(recGain);
   recSrc.onended=()=>{ if(recSrc) stopRecPlay(); };
-  recSrc.start(playStartCtx);
+  recSrc.start(playStartCtx, bufOffset);
 
   // クリックをスケジュール（同じAudioContextタイムライン上）
   recClickNodes=[];
