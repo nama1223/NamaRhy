@@ -237,7 +237,7 @@ small.note{display:block;color:var(--sub);font-size:11.5px;margin-top:8px;line-h
     <div class="card">
       <h2>マイク感度（しきい値）</h2>
       <input type="range" id="sensRange" min="1" max="30" value="5">
-      <p class="hint">大きいほど鈍感（雑音に強い／弱い音を拾わない）。上のメーターを見ながら、演奏時はしっかり白線を超え、無音時は超えない位置に調整します。</p>
+      <p class="hint">大きいほど鈍感（雑音に強い／弱い音を拾わない）。上のメーターを見ながら、演奏時はしっかり白線を超え、無音時は超えない位置に調整します。金管楽器は少し右（鈍感側）から始めることをお勧めします。</p>
     </div>
     <div class="card">
       <h2>データ</h2>
@@ -253,73 +253,29 @@ small.note{display:block;color:var(--sub);font-size:11.5px;margin-top:8px;line-h
 </main>
 <div class="toast" id="toast"></div>
 
-<!-- AudioWorklet: RMS + Spectral Flux をメインスレッドへ送る（管楽器タンギング対応） -->
+<!-- AudioWorklet: RMSと前フレーム差分をメインスレッドへ送る -->
 <script id="worklet" type="text/worklet">
 class RMSProc extends AudioWorkletProcessor{
   constructor(){
     super();
-    this._fftSize=256;
-    this._prevMag=new Float32Array(this._fftSize/2);
-    this._buf=new Float32Array(this._fftSize);
-    this._bufPos=0;
-    this._fluxLo=0.33; this._fluxHi=1.0;
-    this.port.onmessage=e=>{ if(e.data.fluxLo!=null) this._fluxLo=e.data.fluxLo; if(e.data.fluxHi!=null) this._fluxHi=e.data.fluxHi; };
+    this._prevRms=0;
+    // 平滑化用（指数移動平均）
+    this._smoothRms=0;
+    this._alpha=0.6; // 平滑化係数（大きいほど追従が速い）
   }
-  // Cooley-Tukey FFT（実数入力・大きさのみ）
-  _fft(buf){
-    const N=buf.length;
-    const re=new Float32Array(N), im=new Float32Array(N);
-    for(let i=0;i<N;i++) re[i]=buf[i];
-    // ビット反転並べ替え
-    for(let i=1,j=0;i<N;i++){
-      let bit=N>>1;
-      for(;j&bit;bit>>=1) j^=bit;
-      j^=bit;
-      if(i<j){ let t=re[i];re[i]=re[j];re[j]=t; t=im[i];im[i]=im[j];im[j]=t; }
-    }
-    for(let len=2;len<=N;len<<=1){
-      const ang=-2*Math.PI/len;
-      const wRe=Math.cos(ang), wIm=Math.sin(ang);
-      for(let i=0;i<N;i+=len){
-        let curRe=1, curIm=0;
-        for(let j=0;j<len/2;j++){
-          const uRe=re[i+j], uIm=im[i+j];
-          const vRe=re[i+j+len/2]*curRe - im[i+j+len/2]*curIm;
-          const vIm=re[i+j+len/2]*curIm + im[i+j+len/2]*curRe;
-          re[i+j]=uRe+vRe; im[i+j]=uIm+vIm;
-          re[i+j+len/2]=uRe-vRe; im[i+j+len/2]=uIm-vIm;
-          const nRe=curRe*wRe-curIm*wIm;
-          curIm=curRe*wIm+curIm*wRe; curRe=nRe;
-        }
-      }
-    }
-    const mag=new Float32Array(N/2);
-    for(let i=0;i<N/2;i++) mag[i]=Math.sqrt(re[i]*re[i]+im[i]*im[i])/N;
-    return mag;
-  }
-  process(inputs, outputs, params){
+  process(inputs){
     const inp=inputs[0];
     if(inp && inp[0]){
       const ch=inp[0];
+      // RMS計算
       let s=0; for(let i=0;i<ch.length;i++) s+=ch[i]*ch[i];
       const rms=Math.sqrt(s/ch.length);
-      for(let i=0;i<ch.length;i++){
-        this._buf[this._bufPos++]=ch[i];
-        if(this._bufPos>=this._fftSize){
-          this._bufPos=0;
-          const mag=this._fft(this._buf);
-          const lo=Math.floor(mag.length*(this._fluxLo||0.33));
-          const hi=Math.floor(mag.length*(this._fluxHi||1.0));
-          let flux=0;
-          for(let j=lo;j<hi;j++){
-            const diff=mag[j]-this._prevMag[j];
-            if(diff>0) flux+=diff;
-          }
-          this._prevMag.set(mag);
-          this.port.postMessage({t:currentTime, rms, flux});
-        }
-      }
-      if(this._bufPos>0) this.port.postMessage({t:currentTime, rms, flux:0});
+      // 指数移動平均で平滑化（ノイズを減らす）
+      this._smoothRms = this._alpha*rms + (1-this._alpha)*this._smoothRms;
+      // 前フレームとの差分（正の値=音量上昇、負の値=音量低下）
+      const delta = this._smoothRms - this._prevRms;
+      this._prevRms = this._smoothRms;
+      this.port.postMessage({t:currentTime, rms:this._smoothRms, raw:rms, delta});
     }
     return true;
   }
@@ -663,26 +619,22 @@ function renderScore(rhythm, results){
    ========================================================================= */
 const AU={ctx:null,master:null,node:null,analyser:null,stream:null,src:null,mute:null,useWorklet:false,rafAnal:0,wlLoaded:false};
 /* ---------- 楽器プリセット ----------
-   各楽器のオンセット検出パラメータ
-   threshOn   : RMS発音閾値
-   threshOff  : RMS消音閾値
-   minIOI     : 最短発音間隔(秒) ← 連符の最短値より少し短く
-   peakWin    : ピーク探索ウィンドウ(秒)
-   useDip     : タンギングディップ検出を使うか（金管・ダブルリード向け）
-   dipRatio   : 直前ピークからの音量低下率でディップと判定（例：0.55＝55%以下に落ちたら）
-   dipRise    : ディップ後の上昇率でタンギングと判定（例：1.25＝25%上昇）
-   fluxBand   : Spectral Flux を使うビン範囲 [lo割合, hi割合]（0=全域, 木管は高域有効）
-   fluxMult   : fluxThresh = median * fluxMult
+   deltaThresh : RMSの上昇速度の閾値（フレーム間差分）。主たる検出条件。
+   minRms      : 発音と認めるRMSの最低水準
+   threshOff   : 消音判定RMS
+   minIOI      : 最短発音間隔(秒)
+   peakWin     : ピーク探索ウィンドウ(秒)
+   holdTime    : オンセット後この秒数はdeltaトリガーを無視（同一音の揺れを弾く）
 */
 const INSTR_PRESETS={
-  generic:  { threshOn:0.05, threshOff:0.025, minIOI:0.075, peakWin:0.12, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.33,1.0], fluxMult:3.0 },
-  brass:    { threshOn:0.04, threshOff:0.018, minIOI:0.070, peakWin:0.10, useDip:true,  dipRatio:0.32, dipRise:1.55, fluxBand:[0.10,0.50], fluxMult:2.5 },
-  woodwind: { threshOn:0.04, threshOff:0.020, minIOI:0.065, peakWin:0.10, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.25,0.85], fluxMult:2.5 },
-  reed:     { threshOn:0.04, threshOff:0.020, minIOI:0.065, peakWin:0.10, useDip:true,  dipRatio:0.33, dipRise:1.52, fluxBand:[0.20,0.80], fluxMult:2.8 },
-  string:   { threshOn:0.04, threshOff:0.018, minIOI:0.060, peakWin:0.08, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.20,0.80], fluxMult:2.5 },
-  piano:    { threshOn:0.05, threshOff:0.022, minIOI:0.060, peakWin:0.08, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.15,0.75], fluxMult:3.0 },
-  perc:     { threshOn:0.06, threshOff:0.025, minIOI:0.050, peakWin:0.06, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.10,1.0],  fluxMult:2.0 },
-  voice:    { threshOn:0.04, threshOff:0.018, minIOI:0.080, peakWin:0.12, useDip:false, dipRatio:0.35, dipRise:1.50, fluxBand:[0.20,0.70], fluxMult:2.8 },
+  generic:  { deltaThresh:0.018, minRms:0.030, threshOff:0.015, minIOI:0.080, peakWin:0.12, holdTime:0.10 },
+  brass:    { deltaThresh:0.012, minRms:0.025, threshOff:0.012, minIOI:0.075, peakWin:0.12, holdTime:0.12 },
+  woodwind: { deltaThresh:0.020, minRms:0.030, threshOff:0.015, minIOI:0.070, peakWin:0.10, holdTime:0.09 },
+  reed:     { deltaThresh:0.016, minRms:0.028, threshOff:0.013, minIOI:0.070, peakWin:0.10, holdTime:0.10 },
+  string:   { deltaThresh:0.022, minRms:0.030, threshOff:0.015, minIOI:0.065, peakWin:0.09, holdTime:0.08 },
+  piano:    { deltaThresh:0.025, minRms:0.035, threshOff:0.018, minIOI:0.060, peakWin:0.08, holdTime:0.07 },
+  perc:     { deltaThresh:0.030, minRms:0.040, threshOff:0.020, minIOI:0.050, peakWin:0.06, holdTime:0.05 },
+  voice:    { deltaThresh:0.015, minRms:0.025, threshOff:0.012, minIOI:0.090, peakWin:0.14, holdTime:0.12 },
 };
 const INSTR_LABELS={
   generic:'汎用（デフォルト）', brass:'金管楽器（トランペット・ホルン・ユーフォ・トロンボーン・チューバ等）',
@@ -692,121 +644,63 @@ const INSTR_LABELS={
 };
 
 const detector={
-  // 動的パラメータ（楽器プリセットから設定）
-  threshOn:0.05, threshOff:0.025, minIOI:0.075, peakWin:0.12,
-  useDip:false, dipRatio:0.55, dipRise:1.25, fluxBand:[0.33,1.0], fluxMult:3.0,
-  // Spectral Flux
-  fluxThresh:0.012, fluxHistory:[], fluxHistMax:30,
+  // プリセットから設定されるパラメータ
+  deltaThresh:0.018, minRms:0.030, threshOff:0.015, minIOI:0.080, peakWin:0.12, holdTime:0.10,
+  // sens倍率適用前のベース値
+  _baseDelta:0.018, _baseMinRms:0.030, _baseThreshOff:0.015,
   // 状態
   inNote:false, lastOnset:-1, peakVal:0, peakTime:0, onsetTime:0, peakLocked:true,
-  // タンギングディップ検出用
-  rmsHistory:[], rmsHistLen:8,   // 直近RMSのリングバッファ
-  dipMin:1e9, dipMinT:0,         // ディップ中の最小値とその時刻
-  inDip:false,                    // ディップ検出フェーズ中か
   onLevel:null, onOnset:null, onPeak:null,
 
   reset(){
-    this.inNote=false; this.lastOnset=-1; this.peakLocked=true;
-    this.fluxHistory=[]; this.rmsHistory=[];
-    this.inDip=false; this.dipMin=1e9; this.dipPeak=0;
+    this.inNote=false; this.lastOnset=-1; this.peakLocked=true; this.peakVal=0;
   },
 
   setInstrument(key){
     const p=INSTR_PRESETS[key]||INSTR_PRESETS.generic;
     Object.assign(this, p);
-    // sensによるthresh上書き（sensはthreshOnの乗数として使う）
-    // → setSensを再適用
-    this._baseThreshOn=p.threshOn;
-    this._baseThreshOff=p.threshOff;
+    this._baseDelta   = p.deltaThresh;
+    this._baseMinRms  = p.minRms;
+    this._baseThreshOff = p.threshOff;
   },
 
   setSens(s){
-    // sens=1..30 → 係数 0.3..2.0（低いほど敏感）
-    const mult=0.3 + (s-1)/29 * 1.7;
-    const base=this._baseThreshOn||0.05;
-    const baseOff=this._baseThreshOff||0.025;
-    this.threshOn=Math.max(0.008, base*mult);
-    this.threshOff=Math.max(0.004, baseOff*mult);
+    // sens=1(敏感)..30(鈍感) → 閾値を 0.4倍..2.5倍にスケール
+    const mult = 0.4 + (s-1)/29 * 2.1;
+    this.deltaThresh = Math.max(0.003, this._baseDelta   * mult);
+    this.minRms      = Math.max(0.005, this._baseMinRms  * mult);
+    this.threshOff   = Math.max(0.003, this._baseThreshOff * mult);
   },
 
-  feed(t, rms, flux, fluxBinLo, fluxBinHi){
+  feed(t, rms, delta){
     if(this.onLevel) this.onLevel(rms);
 
-    // RMS履歴を蓄積（ディップ検出の安定化用）
-    this.rmsHistory.push({t, v:rms});
-    if(this.rmsHistory.length>this.rmsHistLen) this.rmsHistory.shift();
+    // ── オンセット検出 ──
+    // 条件：① RMSの急上昇（delta > deltaThresh）
+    //       ② 現在のRMSが最低水準以上
+    //       ③ 前回オンセットから minIOI 以上経過
+    //       ④ オンセット直後のホールド期間が終わっている
+    const sinceOnset = t - this.lastOnset;
+    const canTrigger = sinceOnset > this.minIOI;
+    const notHolding = sinceOnset > this.holdTime || this.lastOnset < 0;
 
-    // Flux ノイズフロアを適応推定
-    if(flux>0){
-      this.fluxHistory.push(flux);
-      if(this.fluxHistory.length>this.fluxHistMax) this.fluxHistory.shift();
-      if(this.fluxHistory.length>=8){
-        const sorted=[...this.fluxHistory].sort((a,b)=>a-b);
-        this.fluxThresh=Math.max(0.006, sorted[Math.floor(sorted.length/2)]*this.fluxMult);
-      }
+    if(canTrigger && notHolding && delta >= this.deltaThresh && rms >= this.minRms){
+      this._triggerOnset(t, rms);
+      return;
     }
 
-    const rmsOk  = rms >= this.threshOn;
-    const fluxHit= flux > this.fluxThresh && rms >= this.threshOn * 0.35;
-
-    if(!this.inNote){
-      // ── 通常オンセット検出 ──
-      if((rmsOk || fluxHit) && (t - this.lastOnset) > this.minIOI){
-        this._triggerOnset(t, rms);
-      }
-    } else {
-      // ── 発音中 ──
-
-      // ピーク追跡（peakLocked前のみ）
+    if(this.inNote){
+      // ピーク追跡
       if(!this.peakLocked){
         if(rms > this.peakVal){ this.peakVal=rms; this.peakTime=t; }
         if(t - this.onsetTime >= this.peakWin){
           this.peakLocked=true;
           if(this.onPeak) this.onPeak(this.peakTime);
-          // ピーク確定時点でディップ監視を開始するため、ここでdipPeakを記録
-          this.dipPeak = this.peakVal;
-          this.dipMin  = this.peakVal;
-          this.dipMinT = t;
-          this.inDip   = false;
         }
       }
-
-      // タンギングディップ検出：ピーク確定後のみ実施
-      // 条件：ピーク値から大きく落ち込み（dipRatio以下）→ 底から大きく回復（dipRise倍）
-      if(this.useDip && this.peakLocked && this.dipPeak > 0){
-        const dipThresh = this.dipPeak * this.dipRatio; // 例：ピーク値の32%以下
-
-        if(!this.inDip){
-          // ディップ開始：音量がdipThresh以下 かつ minIOI経過済み
-          if(rms <= dipThresh && (t - this.lastOnset) > this.minIOI){
-            this.inDip   = true;
-            this.dipMin  = rms;
-            this.dipMinT = t;
-          }
-        } else {
-          // ディップ追跡：さらに下がるなら更新
-          if(rms < this.dipMin){ this.dipMin=rms; this.dipMinT=t; }
-
-          // 回復判定：底から dipRise 倍以上 かつ threshOn*0.7 以上 かつ minIOI経過
-          const recovered = rms >= this.dipMin * this.dipRise
-                         && rms >= this.threshOn * 0.7
-                         && (t - this.lastOnset) > this.minIOI;
-          if(recovered){
-            this.inDip = false;
-            // 新しいタンギングとして検出（ディップ最低点をオンセット時刻とする）
-            this.inNote = false;
-            this.dipPeak = 0; // リセット
-            this._triggerOnset(this.dipMinT, rms);
-          }
-
-          // ディップから消音に至った場合はリセット
-          if(rms < this.threshOff){ this.inDip=false; this.dipPeak=0; }
-        }
-      }
-
-      // 完全消音
+      // 消音判定
       if(rms < this.threshOff){
-        this.inNote=false; this.inDip=false; this.dipPeak=0;
+        this.inNote=false;
         if(!this.peakLocked){ this.peakLocked=true; if(this.onPeak) this.onPeak(this.peakTime); }
       }
     }
@@ -815,7 +709,6 @@ const detector={
   _triggerOnset(t, rms){
     this.inNote=true; this.onsetTime=t; this.lastOnset=t;
     this.peakVal=rms; this.peakTime=t; this.peakLocked=false;
-    this.inDip=false; this.dipMin=1e9; this.dipPeak=0;
     if(this.onOnset) this.onOnset(t);
   }
 };
@@ -842,33 +735,23 @@ async function buildInputGraph(){
     try{
       if(!AU.wlLoaded){ const url=URL.createObjectURL(new Blob([$('worklet').textContent],{type:'text/javascript'})); await AU.ctx.audioWorklet.addModule(url); AU.wlLoaded=true; }
       AU.node=new AudioWorkletNode(AU.ctx,'rms-proc');
-      const band=detector.fluxBand||[0.33,1.0];
-      AU.node.port.postMessage({fluxLo:band[0], fluxHi:band[1]});
-      AU.node.port.onmessage=e=>detector.feed(e.data.t, e.data.rms, e.data.flux||0);
+      AU.node.port.onmessage=e=>detector.feed(e.data.t, e.data.rms, e.data.delta||0);
       AU.src.connect(AU.node); AU.node.connect(AU.mute); AU.useWorklet=true; return;
     }catch(e){}
   }
   AU.analyser=AU.ctx.createAnalyser(); AU.analyser.fftSize=512;
   AU.src.connect(AU.analyser); AU.analyser.connect(AU.mute);
   const buf=new Float32Array(AU.analyser.fftSize);
-  const fbuf=new Float32Array(AU.analyser.frequencyBinCount);
-  let prevFbuf=new Float32Array(AU.analyser.frequencyBinCount);
+  let smoothRms=0, prevSmooth=0;
+  const alpha=0.6;
   const loop=()=>{
     AU.analyser.getFloatTimeDomainData(buf);
     let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i];
     const rms=Math.sqrt(s/buf.length);
-    AU.analyser.getFloatFrequencyData(fbuf);
-    // HF帯域（上位1/3）のスペクトルフラックス
-    let flux=0;
-    const lo=Math.floor(fbuf.length/3);
-    for(let i=lo;i<fbuf.length;i++){
-      // getFloatFrequencyData はdB値なのでリニアに変換
-      const cur=Math.pow(10, fbuf[i]/20);
-      const prv=Math.pow(10, prevFbuf[i]/20);
-      const diff=cur-prv; if(diff>0) flux+=diff;
-    }
-    prevFbuf.set(fbuf);
-    detector.feed(AU.ctx.currentTime, rms, flux);
+    smoothRms = alpha*rms + (1-alpha)*smoothRms;
+    const delta = smoothRms - prevSmooth;
+    prevSmooth = smoothRms;
+    detector.feed(AU.ctx.currentTime, smoothRms, delta);
     AU.rafAnal=requestAnimationFrame(loop);
   };
   loop();
@@ -1207,12 +1090,10 @@ $('instrSel').addEventListener('change',e=>{
   DB.instrument=e.target.value; save();
   detector.setInstrument(DB.instrument);
   detector.setSens(DB.sens);
-  // Workletが起動中なら帯域設定も更新
-  if(AU.node){ const band=detector.fluxBand||[0.33,1.0]; AU.node.port.postMessage({fluxLo:band[0],fluxHi:band[1]}); }
   updateThrMark(); updateInstrHint();
   toast('楽器を「'+INSTR_LABELS[DB.instrument]+'」に設定しました');
 });
-function updateThrMark(){ $('meterThr').style.left=Math.min(100,detector.threshOn/0.3*100)+'%'; }
+function updateThrMark(){ $('meterThr').style.left=Math.min(100,detector.minRms/0.3*100)+'%'; }
 detector.onLevel=rms=>{ const bar=$('meterBar'); if(bar && $('s-set').classList.contains('on')) bar.style.width=Math.min(100,rms/0.3*100)+'%'; };
 
 async function populateMics(){
