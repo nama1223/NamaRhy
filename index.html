@@ -205,9 +205,9 @@ small.note{display:block;color:var(--sub);font-size:11.5px;margin-top:8px;line-h
     <!-- デバッグパネル（開発用・本番では非表示） -->
     <div id="dbgPanel">
       <h3>🔬 検出デバッグ</h3>
-      <div class="dbg-row"><span class="dbg-label">RMS（平滑化後）</span><span class="dbg-val" id="dbgRms">--</span></div>
+      <div class="dbg-row"><span class="dbg-label">RMS（fast）</span><span class="dbg-val" id="dbgRms">--</span></div>
       <div class="dbg-meter"><div class="dbg-meter-bar" id="dbgRmsBar"></div><div class="dbg-thr" id="dbgRmsThr"></div></div>
-      <div class="dbg-row"><span class="dbg-label">Spike（背景超過量）</span><span class="dbg-val" id="dbgDelta">--</span></div>
+      <div class="dbg-row"><span class="dbg-label">RiseScaled / Spike</span><span class="dbg-val" id="dbgDelta">--</span></div>
       <div class="dbg-meter"><div class="dbg-meter-bar" id="dbgDeltaBar" style="background:linear-gradient(90deg,#10b6c9,#16a34a)"></div><div class="dbg-thr" id="dbgDeltaThr"></div></div>
       <div class="dbg-row"><span class="dbg-label">状態</span><span class="dbg-val" id="dbgState">--</span></div>
       <div class="dbg-row"><span class="dbg-label">検出イベント数</span><span class="dbg-val" id="dbgEvCount">0</span></div>
@@ -290,14 +290,15 @@ small.note{display:block;color:var(--sub);font-size:11.5px;margin-top:8px;line-h
 </main>
 <div class="toast" id="toast"></div>
 
-<!-- AudioWorklet: 強平滑化RMS + 発音立ち上がりスパイク検出 -->
+<!-- AudioWorklet: 3段階平滑化でタンギングのディップ回復を検出 -->
 <script id="worklet" type="text/worklet">
 class RMSProc extends AudioWorkletProcessor{
   constructor(){
     super();
-    this._slow = 0;   // 遅い平滑化（背景レベル推定）α=0.05
-    this._fast = 0;   // 速い平滑化（瞬時レベル）    α=0.30
-    this._prev = 0;   // 前フレームのfast値
+    this._inst = 0;   // 瞬時（α=0.70）：タンギングの谷をリアルタイムで追う
+    this._fast = 0;   // 短期（α=0.15）：音符単位の音量
+    this._slow = 0;   // 長期（α=0.02）：背景・持続レベル
+    this._prevInst = 0;
   }
   process(inputs){
     const inp=inputs[0];
@@ -306,25 +307,33 @@ class RMSProc extends AudioWorkletProcessor{
       let s=0; for(let i=0;i<ch.length;i++) s+=ch[i]*ch[i];
       const rms=Math.sqrt(s/ch.length);
 
-      // 速い追従（瞬時音量）
-      this._fast = 0.30*rms + 0.70*this._fast;
-      // 遅い追従（背景・持続音レベル）
-      this._slow = 0.05*rms + 0.95*this._slow;
+      this._inst = 0.70*rms + 0.30*this._inst;
+      this._fast = 0.15*rms + 0.85*this._fast;
+      this._slow = 0.02*rms + 0.98*this._slow;
 
-      // delta = fast - prev（前フレームからの上昇量のみ使う）
-      const delta = this._fast - this._prev;
-      this._prev = this._fast;
+      // rise: 前フレームからの瞬時上昇量（正のみ）
+      const rise = Math.max(0, this._inst - this._prevInst);
+      this._prevInst = this._inst;
 
-      // onset候補スコア：fastが slowを大きく上回った量
-      // → 持続音中はfast≒slowなのでほぼ0、タンギングの立ち上がりだけ大きくなる
-      const spike = Math.max(0, this._fast - this._slow * 1.15);
+      // spike: instantがfastを超えた量（立ち上がり検出・無音→発音）
+      const spike = Math.max(0, this._inst - this._fast * 1.1);
+
+      // dipRecover: fastがslowの一定割合以上かつinstが前フレームより上昇
+      // → 持続音中のタンギングディップからの回復を検出
+      // fast/slow比が小さいほど「今は相対的に静か」= ディップ中
+      const ratio = this._slow > 0.001 ? this._fast / this._slow : 1;
+      // riseScaled: slowを基準にした相対的な上昇量
+      const riseScaled = this._slow > 0.001 ? rise / this._slow : 0;
 
       this.port.postMessage({
         t: currentTime,
-        rms: this._fast,
-        raw: rms,
-        delta: Math.max(0, delta),  // 正の変化量のみ
-        spike                        // 背景レベルを超えた量
+        rms:  this._fast,
+        inst: this._inst,
+        slow: this._slow,
+        spike,
+        rise,
+        riseScaled,
+        ratio
       });
     }
     return true;
@@ -669,21 +678,22 @@ function renderScore(rhythm, results){
    ========================================================================= */
 const AU={ctx:null,master:null,node:null,analyser:null,stream:null,src:null,mute:null,useWorklet:false,rafAnal:0,wlLoaded:false};
 /* ---------- 楽器プリセット ----------
-   spikeThresh : fast-slow*1.15 の閾値（持続音中≒0、タンギング立ち上がり時に急増）
-   minRms      : 発音と認めるfastRMSの最低水準
-   threshOff   : 消音判定（fastRMSがこれを下回ったらinNote解除）
-   minIOI      : 最短発音間隔(秒)
-   peakWin     : ピーク探索ウィンドウ(秒)
+   spikeThresh   : 無音→発音の検出閾値（spike = inst - fast*1.1）
+   riseThresh    : HOLD中タンギング検出の相対上昇閾値（riseScaled = rise/slow）
+   minRms        : 発音と認めるfastRMSの最低水準
+   threshOff     : 消音判定（fastRMSがこれを下回ったらinNote解除）
+   minIOI        : 最短発音間隔(秒)
+   peakWin       : ピーク探索ウィンドウ(秒)
 */
 const INSTR_PRESETS={
-  generic:  { spikeThresh:0.018, minRms:0.020, threshOff:0.010, minIOI:0.060, peakWin:0.12 },
-  brass:    { spikeThresh:0.012, minRms:0.015, threshOff:0.008, minIOI:0.060, peakWin:0.12 },
-  woodwind: { spikeThresh:0.018, minRms:0.020, threshOff:0.010, minIOI:0.055, peakWin:0.10 },
-  reed:     { spikeThresh:0.015, minRms:0.018, threshOff:0.009, minIOI:0.055, peakWin:0.10 },
-  string:   { spikeThresh:0.020, minRms:0.022, threshOff:0.011, minIOI:0.050, peakWin:0.09 },
-  piano:    { spikeThresh:0.025, minRms:0.025, threshOff:0.012, minIOI:0.050, peakWin:0.08 },
-  perc:     { spikeThresh:0.030, minRms:0.030, threshOff:0.015, minIOI:0.040, peakWin:0.06 },
-  voice:    { spikeThresh:0.015, minRms:0.018, threshOff:0.008, minIOI:0.070, peakWin:0.14 },
+  generic:  { spikeThresh:0.015, riseThresh:0.25, minRms:0.015, threshOff:0.008, minIOI:0.060, peakWin:0.12 },
+  brass:    { spikeThresh:0.010, riseThresh:0.18, minRms:0.012, threshOff:0.006, minIOI:0.055, peakWin:0.12 },
+  woodwind: { spikeThresh:0.015, riseThresh:0.25, minRms:0.015, threshOff:0.008, minIOI:0.050, peakWin:0.10 },
+  reed:     { spikeThresh:0.012, riseThresh:0.20, minRms:0.013, threshOff:0.007, minIOI:0.050, peakWin:0.10 },
+  string:   { spikeThresh:0.018, riseThresh:0.28, minRms:0.016, threshOff:0.008, minIOI:0.045, peakWin:0.09 },
+  piano:    { spikeThresh:0.020, riseThresh:0.30, minRms:0.018, threshOff:0.009, minIOI:0.045, peakWin:0.08 },
+  perc:     { spikeThresh:0.025, riseThresh:0.35, minRms:0.022, threshOff:0.010, minIOI:0.035, peakWin:0.06 },
+  voice:    { spikeThresh:0.012, riseThresh:0.20, minRms:0.013, threshOff:0.006, minIOI:0.065, peakWin:0.14 },
 };
 const INSTR_LABELS={
   generic:'汎用（デフォルト）', brass:'金管楽器（トランペット・ホルン・ユーフォ・トロンボーン・チューバ等）',
@@ -693,46 +703,88 @@ const INSTR_LABELS={
 };
 
 const detector={
-  spikeThresh:0.018, minRms:0.020, threshOff:0.010, minIOI:0.060, peakWin:0.12,
-  _baseSpike:0.018, _baseMinRms:0.020, _baseThreshOff:0.010,
+  spikeThresh:0.015, riseThresh:0.25, minRms:0.015, threshOff:0.008, minIOI:0.060, peakWin:0.12,
+  _baseSpike:0.015, _baseRise:0.25, _baseMinRms:0.015, _baseThreshOff:0.008,
   inNote:false, lastOnset:-1, peakVal:0, peakTime:0, onsetTime:0, peakLocked:true,
+  // HOLD中ディップ追跡用
+  _dipMin:1, _dipMinT:0, _inDip:false,
   onLevel:null, onOnset:null, onPeak:null, onDebug:null,
 
   reset(){
     this.inNote=false; this.lastOnset=-1; this.peakLocked=true; this.peakVal=0;
+    this._dipMin=1; this._inDip=false;
   },
 
   setInstrument(key){
     const p=INSTR_PRESETS[key]||INSTR_PRESETS.generic;
     Object.assign(this, p);
     this._baseSpike     = p.spikeThresh;
+    this._baseRise      = p.riseThresh;
     this._baseMinRms    = p.minRms;
     this._baseThreshOff = p.threshOff;
   },
 
   setSens(s){
+    // sens=1(敏感)..30(鈍感) → 閾値を 0.4倍..2.5倍にスケール
     const mult = 0.4 + (s-1)/29 * 2.1;
-    this.spikeThresh = Math.max(0.003, this._baseSpike     * mult);
-    this.minRms      = Math.max(0.003, this._baseMinRms    * mult);
-    this.threshOff   = Math.max(0.002, this._baseThreshOff * mult);
+    this.spikeThresh = Math.max(0.002, this._baseSpike     * mult);
+    this.riseThresh  = Math.max(0.05,  this._baseRise      * mult);
+    this.minRms      = Math.max(0.002, this._baseMinRms    * mult);
+    this.threshOff   = Math.max(0.001, this._baseThreshOff * mult);
   },
 
-  feed(t, rms, delta, spike){
-    // delta/spikeが未定義（旧analyserフォールバック）のときはdeltaで代用
-    if(spike === undefined) spike = Math.max(0, delta||0);
+  feed(t, rms, _delta, spike, rise, riseScaled, ratio){
+    // analyserフォールバック時はspike=riseScaled=0で来るので補完
+    if(spike      === undefined) spike      = 0;
+    if(riseScaled === undefined) riseScaled = 0;
+    if(ratio      === undefined) ratio      = 1;
+
     if(this.onLevel) this.onLevel(rms);
 
+    const sinceOnset = t - this.lastOnset;
+    const canTrigger = sinceOnset > this.minIOI;
+
     if(!this.inNote){
-      // 待機中：spikeを見てオンセット検出
-      const canTrigger = (t - this.lastOnset) > this.minIOI;
+      // ── 待機中：spike（無音→発音の立ち上がり）で検出 ──
       if(canTrigger && spike >= this.spikeThresh && rms >= this.minRms){
         this._triggerOnset(t, rms);
-        if(this.onDebug) this.onDebug({t, rms, spike, triggered:true, state:'ONSET'});
+        if(this.onDebug) this.onDebug({t, rms, spike, riseScaled, triggered:true, state:'ONSET(spike)'});
         return;
       }
-      if(this.onDebug) this.onDebug({t, rms, spike, triggered:false, state:'WAIT'});
+      if(this.onDebug) this.onDebug({t, rms, spike, riseScaled, triggered:false, state:'WAIT'});
+
     } else {
-      // 発音中：spikeは完全無視、消音のみ監視
+      // ── 発音中：ディップ回復でタンギングを検出 ──
+      //
+      // ユーフォニアムのタンギングは：
+      //   音量が持続 → タンギングで一瞬落ちる → 次の音で回復
+      // riseScaled = rise/slow で「持続レベルを基準にした相対的上昇量」を見る
+      // ディップ（ratio低下）を経由した後のriseScaledが閾値超えでオンセット
+
+      // ratio = fast/slow。タンギング時はfastがslowを一時的に下回る
+      if(!this._inDip && ratio < 0.85 && canTrigger){
+        // ディップ開始
+        this._inDip = true;
+        this._dipMin = ratio;
+        this._dipMinT = t;
+      }
+      if(this._inDip){
+        if(ratio < this._dipMin){ this._dipMin = ratio; this._dipMinT = t; }
+        // ディップ後の回復：riseScaledが閾値を超えたらタンギングと判定
+        if(riseScaled >= this.riseThresh && canTrigger && rms >= this.minRms){
+          this._inDip = false;
+          // ピーク確定してからオンセット
+          if(!this.peakLocked){ this.peakLocked=true; if(this.onPeak) this.onPeak(this.peakTime); }
+          this.inNote = false;
+          this._triggerOnset(this._dipMinT, rms);
+          if(this.onDebug) this.onDebug({t, rms, spike, riseScaled, triggered:true, state:'ONSET(dip)'});
+          return;
+        }
+        // ディップから戻らず消音した場合はリセット
+        if(rms < this.threshOff) this._inDip = false;
+      }
+
+      // ピーク追跡
       if(!this.peakLocked){
         if(rms > this.peakVal){ this.peakVal=rms; this.peakTime=t; }
         if(t - this.onsetTime >= this.peakWin){
@@ -740,17 +792,19 @@ const detector={
           if(this.onPeak) this.onPeak(this.peakTime);
         }
       }
+      // 消音
       if(rms < this.threshOff){
-        this.inNote=false;
+        this.inNote=false; this._inDip=false;
         if(!this.peakLocked){ this.peakLocked=true; if(this.onPeak) this.onPeak(this.peakTime); }
       }
-      if(this.onDebug) this.onDebug({t, rms, spike, triggered:false, state:'HOLD'});
+      if(this.onDebug) this.onDebug({t, rms, spike, riseScaled, triggered:false, state: this._inDip?'DIP':'HOLD'});
     }
   },
 
   _triggerOnset(t, rms){
     this.inNote=true; this.onsetTime=t; this.lastOnset=t;
     this.peakVal=rms; this.peakTime=t; this.peakLocked=false;
+    this._inDip=false; this._dipMin=1;
     if(this.onOnset) this.onOnset(t);
   }
 };
@@ -777,22 +831,30 @@ async function buildInputGraph(){
     try{
       if(!AU.wlLoaded){ const url=URL.createObjectURL(new Blob([$('worklet').textContent],{type:'text/javascript'})); await AU.ctx.audioWorklet.addModule(url); AU.wlLoaded=true; }
       AU.node=new AudioWorkletNode(AU.ctx,'rms-proc');
-      AU.node.port.onmessage=e=>detector.feed(e.data.t, e.data.rms, e.data.delta||0, e.data.spike||0);
+      AU.node.port.onmessage=e=>{
+        const d=e.data;
+        detector.feed(d.t, d.rms, 0, d.spike||0, d.rise||0, d.riseScaled||0, d.ratio||1);
+      };
       AU.src.connect(AU.node); AU.node.connect(AU.mute); AU.useWorklet=true; return;
     }catch(e){}
   }
   AU.analyser=AU.ctx.createAnalyser(); AU.analyser.fftSize=512;
   AU.src.connect(AU.analyser); AU.analyser.connect(AU.mute);
   const buf=new Float32Array(AU.analyser.fftSize);
-  let fast=0, slow=0;
+  let inst=0, fast=0, slow=0, prevInst=0;
   const loop=()=>{
     AU.analyser.getFloatTimeDomainData(buf);
     let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i];
     const rms=Math.sqrt(s/buf.length);
-    fast = 0.30*rms + 0.70*fast;
-    slow = 0.05*rms + 0.95*slow;
-    const spike = Math.max(0, fast - slow*1.15);
-    detector.feed(AU.ctx.currentTime, fast, 0, spike);
+    inst = 0.70*rms + 0.30*inst;
+    fast = 0.15*rms + 0.85*fast;
+    slow = 0.02*rms + 0.98*slow;
+    const rise = Math.max(0, inst - prevInst);
+    prevInst = inst;
+    const spike = Math.max(0, inst - fast*1.1);
+    const riseScaled = slow > 0.001 ? rise/slow : 0;
+    const ratio = slow > 0.001 ? fast/slow : 1;
+    detector.feed(AU.ctx.currentTime, fast, 0, spike, rise, riseScaled, ratio);
     AU.rafAnal=requestAnimationFrame(loop);
   };
   loop();
@@ -1175,28 +1237,27 @@ let dbgEnabled=false;
 const DBG_MAX_LOG=60;
 let dbgEvents=[];
 
-function dbgUpdate({t, rms, spike, triggered, state}){
+function dbgUpdate({t, rms, spike, riseScaled, triggered, state}){
   if(!dbgEnabled) return;
-  // メーター更新（~30fps間引き）
   if(!dbgUpdate._last || t-dbgUpdate._last > 0.033){
     dbgUpdate._last=t;
-    const rmsMax=0.25, spikeMax=0.06;
+    const rmsMax=0.25, spikeMax=0.06, riseMax=0.8;
     $('dbgRms').textContent   = rms.toFixed(4);
-    $('dbgDelta').textContent = (spike||0).toFixed(4);
+    $('dbgDelta').textContent = (riseScaled||0).toFixed(3)+'  spike:'+(spike||0).toFixed(4);
     $('dbgRmsBar').style.width   = Math.min(100,rms/rmsMax*100)+'%';
-    $('dbgDeltaBar').style.width = Math.min(100,(spike||0)/spikeMax*100)+'%';
+    $('dbgDeltaBar').style.width = Math.min(100,(riseScaled||0)/riseMax*100)+'%';
     $('dbgRmsThr').style.left    = Math.min(99,detector.minRms/rmsMax*100)+'%';
-    $('dbgDeltaThr').style.left  = Math.min(99,detector.spikeThresh/spikeMax*100)+'%';
+    $('dbgDeltaThr').style.left  = Math.min(99,detector.riseThresh/riseMax*100)+'%';
     $('dbgState').textContent=state;
-    $('dbgState').style.color=triggered?'var(--ok)':state==='HOLD'?'#f59e0b':'var(--sub)';
+    $('dbgState').style.color=triggered?'var(--ok)':state==='DIP'?'#f59e0b':state==='HOLD'?'#9aa0c8':'var(--sub)';
     $('dbgEvCount').textContent=dbgEvents.length;
   }
   if(triggered){
-    dbgEvents.push({t:t.toFixed(3), spike:(spike||0).toFixed(4), rms:rms.toFixed(4)});
+    dbgEvents.push({t:t.toFixed(3), rise:(riseScaled||0).toFixed(3), rms:rms.toFixed(4), st:state});
     if(dbgEvents.length>DBG_MAX_LOG) dbgEvents.shift();
     const log=$('dbgLog');
     log.innerHTML=dbgEvents.slice().reverse().map(e=>
-      `<div class="ev"><span class="ti">${e.t}s</span><span class="dv">Sp:${e.spike}</span><span class="rv">RMS:${e.rms}</span></div>`
+      `<div class="ev"><span class="ti">${e.t}s</span><span class="dv">Rs:${e.rise}</span><span class="rv">RMS:${e.rms}</span><span style="color:#f59e0b;font-size:10px">${e.st}</span></div>`
     ).join('');
   }
 }
